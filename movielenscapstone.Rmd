@@ -1,0 +1,818 @@
+---
+title: "MovieLens Capstone"
+author: "Christopher C. Smith"
+date: "1/15/2022"
+output: pdf_document
+---
+
+# Designing a Movie Recommendation Engine
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE, include=TRUE, echo=FALSE, cache=TRUE)
+
+#Prep movielens dataset for analysis
+# Note: this process could take a couple of minutes
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+library(tidyverse)
+library(caret)
+library(data.table)
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+movielens <- left_join(ratings, movies, by = "movieId")
+sample <- head(movielens)
+```
+
+## Introduction
+
+The objective of this project is to build a Netflix-style recommendation system that can predict a user's star rating for a movie (from 0.5 to 5.0) with a residual mean squared error (RMSE) of less than 0.86490. Since Netflix doesn't make its data available, we use the MovieLens 10M data set, which is freely available online at <https://grouplens.org/datasets/movielens/10m/>. According to the data set summary, "This data set contains 10,000,054 ratings and 95,580 tags applied to 10,681 movies by 71,567 users of the online movie recommender service MovieLens. Users were selected at random for inclusion. All users selected had rated at least 20 movies. Unlike previous MovieLens data sets, no demographic information is included. Each user is represented by an id, and no other information is provided." For the purposes of this study, I will use the movie and ratings data while ignoring the user-applied descriptive tags.
+
+After downloading the data, I perform some rudimentary cleaning steps and merge the ratings.dat and movies.dat files into a single data frame with the columns `r names(sample)[1:(ncol(sample)-1)]`, and `r names(sample)[ncol(sample)]`. (The "title" variable takes the format "`r sample$title[1]`"; it's possible to extract the release date to create an additional variable, should I wish to do so.) The "genres" variable is a single character string containing all genres into which a given movie fits, separated by "|", e.g.: "`r sample$genres[1]`". We randomly partition the data into a training set, which we will use for building our model, and a validation set, which we won't look at or touch until it comes time to test our completed model at the end. (To prevent overfitting, we will follow the cardinal rule of machine learning: do not use validation data to make any modeling decisions!) Our training set includes 90% of the data, while our validation set includes 10%. For reproducibility, we set the seed to 1. We then run a check to ensure that all movies and users in the validation set also appear in the training set. If any do not, we transfer them into the training set.
+
+```{r partition_1, include=FALSE, echo=FALSE}
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+To allow for testing and choosing between models, we repeat this process to further partition our training data into train and test data sets. We again use a randomized 90-10 partition and set the seed to 1.
+
+```{r partition_2, include=FALSE,echo=TRUE}
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = edx$rating, times = 1, p = 0.1, list = FALSE)
+train_set <- edx[-test_index,]
+temp <- edx[test_index,]
+
+test_set <- temp %>% 
+  semi_join(train_set, by = "movieId") %>%
+  semi_join(train_set, by = "userId")
+
+removed <- anti_join(temp, test_set)
+train_set <- rbind(train_set, removed)
+rm(test_index, temp, removed)
+```
+
+To measure the accuracy of our predictions, we will use residual mean squared error, defined as the square root of the mean of the squared differences between our true ratings and our predicted ratings. To calculate residual mean squared error, we define the following function:
+
+```{r define_function, include=TRUE, echo=TRUE}
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+The most accurate model will be the one the minimizes RMSE. As mentioned above, we are targeting an RMSE of less than 0.86490 when testing the final model on the validation data set.
+
+Achieving this target RMSE proves to be fairly trivial; it isn't even necessary to take into account any pairwise correlations between movies or individual user preferences (apart from average user rating). We can get there with a simple model that uses just five averages and a statistical technique called regularization. The five regularized averages used in the final model are: overall average rating, average rating for each movie, average rating for each user, average rating for each combination of genres, and average rating by binned date (which variable I will tune to find the optimal bin size).
+
+## Methods
+
+I build two models. The second model builds on the first, so that my final model is highly accurate.
+
+In my base model, I examine in sequence the overall average rating, the average rating for each movie, the average rating for each user, the average rating for each combination of genres, and the average rating by binned date (which variable I "tune" with 5-fold cross-validation to find the optimal bin size). In each case, I calculate the average, use it to predict ratings on the test set, and then subtract it from the data, leaving "residuals" from which to calculate the next average. By this process, I build a cumulative model that beats my target RMSE when predicting ratings for my test set, but with an insufficient margin of safety.
+
+```{r half_star_ratings, include = TRUE, echo=FALSE}
+first_half_star <- train_set %>% 
+  filter(rating %in% c(0.5,1.5,2.5,3.5,4.5)) %>%
+  pull(timestamp) %>%
+  min()
+```
+
+(When making predictions with this and subsequent models, I disallow predictions above the maximum possible rating and below the minimum possible rating. The range of ratings in my data is `r min(edx$rating)` to `r max(edx$rating)`, but a little data exploration reveals that MovieLens did not begin to allow half-star ratings until `r year(as_datetime(first_half_star))`. The first half-star rating in my training set is time stamped `r as_datetime(first_half_star)`. Therefore, whenever making predictions with one of my models, I disallow predictions below 0.5 or above 5 for any rating made after `r as_datetime(first_half_star)`. For ratings prior to this time, I disallow any prediction below 1 or above 5.) 
+
+In my regularized model, I refine my base model using a statistical technique called regularization. Recognizing that that some of my averages are calculated for a small sample size (i.e. for bins that contain a small number of data points), I "punish" these small-sample averages by regressing them toward the mean. A regularized average is calculated as the sum of observations divided by the sum of sample size plus a correction factor lambda. In each case, I "tune" lambda by finding the value of lambda that minimizes RMSE in 5-fold cross-validation. The resulting model outperforms the base model for predicting ratings on my test set and again beats my target RMSE, this time with a good margin of safety. In an attempt to refine this model, I also try a smoothed loess function rather than a binned average for my date variable. I tune the function's smoothing span with 10-fold cross validation. Unfortunately, this approach slightly underperforms the regularized average, so I reject this refinement and proceed to validation.
+
+### Base Model
+
+```{r first_attempt_1, include = TRUE, echo=FALSE}
+
+# Build cumulative Naive, Movie, User, Genre, & Date Avg Models -----------
+
+#Build Naive Avg model
+
+#Find average movie rating, use this to predict all ratings, and save RMSE result
+mu <- mean(train_set$rating)
+naive_rmse <- RMSE(test_set$rating, mu)
+rmse_results <- data.frame(model = "Naive average", RMSE = naive_rmse)
+```
+
+For my first attempt to build a model, I first find the average rating for each user, mu = `r mu`. Using this value to predict all ratings in the test set gives me an RMSE of `r naive_rmse`. This is my baseline. In calculating all subsequent averages, I will first subtract or "sweep out" mu from all ratings in the training set. This converts my ratings to a set of positive and negative "residual" values with a mean of zero. Positive values represent a rating above mu, and negative values represent a rating below mu. A residual value of exactly zero represents a rating of exactly mu. 
+
+```{r first_attempt_2, include = TRUE, echo=FALSE}
+
+# Build cumulative Naive, Movie, User, Genre, & Date Avg Models -----------
+
+#Build Movie Avg model
+
+#Sweep out overall average and find residual average for each individual movie
+movie_avgs <- train_set %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+#use this + naive avg to predict ratings and save RMSE result
+predicted_ratings <- test_set %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  mutate(pred = mu + b_i) %>%
+  .$pred
+```
+
+Some movies are better than others. Consequently, different movies have different average ratings. To account for this, I group the data set by movie ID and find the mean "residual" rating for each individual movie, b_i. For instance, my residual average for movie ID #`r movie_avgs$movieId[1]` is `r movie_avgs$b_i[1]`, meaning that this movie's average rating is `r movie_avgs$b_i[1]` above mu. I use this formula to predict ratings in my test set. 
+
+```{r first_attempt_2_results}
+movie_avg_rmse <- RMSE(test_set$rating,predicted_ratings)
+if(any(predicted_ratings > 5 | predicted_ratings < 1)){
+  predicted_ratings <- if_else(predicted_ratings > 5,5,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp < first_half_star & predicted_ratings < 1,1,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp >= first_half_star & predicted_ratings < 0.5,0.5,predicted_ratings)
+}
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(model="Naive + movie average",
+                                     RMSE = movie_avg_rmse))
+```
+
+After thus using my model to predict ratings for the test set (and converting all out-of-bounds ratings to 0.5, 1, or 5), I calculate the RMSE for this cumulative "Naive average + movie average model": `r movie_avg_rmse`. This is a very significant improvement over using just our naive average, mu. To prepare to calculate our next set of averages, we "sweep out" each movie's residual average by subtracting it from all ratings for that movie. This leaves us with another set of "residual" ratings, with a mean of zero for each movie.
+
+```{r first_attempt_3, include = TRUE, echo=FALSE}
+
+#Build User Avg model
+
+#Sweep out overall and movie averages and find residual average for each user
+user_avgs <- train_set %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+#use this + naive + movie avgs to predict ratings and save RMSE result
+predicted_ratings <- test_set %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+if(any(predicted_ratings > 5 | predicted_ratings < 1)){
+  predicted_ratings <- if_else(predicted_ratings > 5,5,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp < first_half_star & predicted_ratings < 1,1,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp >= first_half_star & predicted_ratings < 0.5,0.5,predicted_ratings)
+}
+user_avg_rmse <- RMSE(test_set$rating,predicted_ratings)
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(model="Naive + movie + user average",  
+                                     RMSE = user_avg_rmse ))
+
+#Build Genre Avg model
+
+#Sweep out overall, movie, and user averages and find residual average for each 
+#genre combination
+genre_avgs <- train_set %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(genres) %>% 
+  summarize(b_g = mean(rating - mu - b_i - b_u))
+
+#use this + naive + movie + user avg to predict ratings and save RMSE result
+predicted_ratings <- test_set %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  mutate(pred = mu + b_i + b_u + b_g) %>%
+  .$pred
+if(any(predicted_ratings > 5 | predicted_ratings < 1)){
+  predicted_ratings <- if_else(predicted_ratings > 5,5,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp < first_half_star & predicted_ratings < 1,1,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp >= first_half_star & predicted_ratings < 0.5,0.5,predicted_ratings)
+}
+genre_avg_rmse <- RMSE(test_set$rating,predicted_ratings)
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(model="Naive + movie + user + genre average",
+                                     RMSE = genre_avg_rmse ))
+
+```
+
+Some users have a naturally positive temperament and give the movies they watch a high average rating. Other users are quite critical and give the movies they watch a low average rating. Also, some genres are better liked than others overall. To incorporate these insights into my model, I repeat the process of calculating and then sweeping out residual averages for each user and for each combination of genres. Predicting ratings in the test set with my naive average mu, my residual movie average b_i, and my residual user average b_u (mu + b_i + b_u) produces an improved RMSE of `r user_avg_rmse`. Adding genre effects (b_g) to the model brings RMSE down a little further, to `r genre_avg_rmse`. In theory, I am already beating my target RMSE of 0.86490, but I'm not beating it with any margin of safety, and there's no guarantee that the model will perform as well as on the validation data as it does on the test data, so I'm going to continue refining the model.
+
+What about time effects? Seasonal patterns or world events might affect users' mood, causing them to rate movies higher or lower on some days than on other days. (For instance, one study found that stock prices perform worse in gloomy, rainy weather!) To incorporate these effects into my model using an average, however, proves complicated, because my rating timestamps are a continuous rather than categorical variable. I must convert them to a categorical variable by "stratifying" or "rounding" the timestamps into "bins". But how do I choose the optimal "bin" size? Should I round to the nearest week? Month? Year? To answer this question, I use 5-fold cross-validation to "tune" the bin size. (In effect, this means that I partition my training data five times, each time with 4/5 of my data used for training and and 1/5 used for testing, and then I test the three different bin sizes on each of the five partitions and select the bin size that minimizes RMSE on average over the five tests. This operation is somewhat computationally intensive and takes a few minutes to run.)
+
+```{r first_attempt_4, include = FALSE, echo=FALSE}
+#Build Date Avg model
+
+library(lubridate)
+
+#Tune optimal rounding  (week, month, or year) with 5-fold cross validation 
+set.seed(1,sample.kind="Rounding")
+folds <- createFolds(train_set$rating, k = 5, list = TRUE, returnTrain = FALSE)
+
+date_avg_rmse <- map_dfr(c("week","month","year"),function(tuner){
+  rmse <- map(1:5,function(curr_fold){
+    #Create folds and make sure all rounded dates in tune_set are in tr_set
+    tr_set <- train_set[-folds[[curr_fold]],] %>%
+      mutate(date = round_date(as.Date(as_datetime(timestamp)),unit=tuner))
+    temp <- train_set[folds[[curr_fold]],] %>%
+      mutate(date = round_date(as.Date(as_datetime(timestamp)),unit=tuner))
+    tune_set <- temp %>% 
+      semi_join(tr_set, by = "date")
+    removed <- suppressMessages(anti_join(temp,tune_set))
+    tr_set <- rbind(tr_set, removed)
+    
+    #Sweep out overall, movie, user, and genre averages and find residual average 
+    #for each date in the time series
+    date_avgs <- tr_set %>% 
+      left_join(movie_avgs, by='movieId') %>%
+      left_join(user_avgs, by='userId') %>%
+      left_join(genre_avgs, by='genres') %>%
+      group_by(date) %>% 
+      summarize(b_d = mean(rating - mu - b_i - b_u - b_g))
+    
+    #use this + naive + movie + user + genre avg to predict ratings
+    predicted_ratings <- tune_set %>% 
+      left_join(movie_avgs, by='movieId') %>%
+      left_join(user_avgs, by='userId') %>%
+      left_join(genre_avgs, by='genres') %>%
+      left_join(date_avgs, by='date') %>%
+      mutate(pred = mu + b_i + b_u + b_g + b_d) %>%
+      .$pred
+    
+    #disallow predictions < 0.5 or > 5.0
+    if(any(predicted_ratings > 5 | predicted_ratings < 1)){
+      predicted_ratings <- if_else(predicted_ratings > 5,5,predicted_ratings)
+      predicted_ratings <- if_else(test_set$timestamp < first_half_star & predicted_ratings < 1,1,predicted_ratings)
+      predicted_ratings <- if_else(test_set$timestamp >= first_half_star & predicted_ratings < 0.5,0.5,predicted_ratings)
+    }
+    
+    #Save rmse result
+    RMSE(tune_set$rating,predicted_ratings)
+  }) %>% unlist()
+  date_avg_rmse <- data.frame(tuner = tuner,rmse = mean(rmse))
+})
+
+#Plot tuning results and get optimal tuning parameter
+ggplot(date_avg_rmse,aes(x=fct_reorder(tuner,c(1,2,3)),y=rmse)) + 
+  geom_point(shape=1) +
+  xlab("rounding unit") +
+  ggtitle("Tuning result for date bin size")
+date_avg_rmse <- date_avg_rmse %>% filter(rmse == min(rmse))
+
+#Add a rounded date variable to our train and test sets using the optimal tuner
+train_set <- train_set %>% 
+  mutate(date = round_date(as.Date(as_datetime(timestamp)),unit=date_avg_rmse$tuner[1]))
+test_set <- test_set %>% 
+  mutate(date = round_date(as.Date(as_datetime(timestamp)),unit=date_avg_rmse$tuner[1]))
+
+#Use our optimal tuning parameter to predict on the test set and save rmse
+date_avgs <- train_set %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  group_by(date) %>% 
+  summarize(b_d = mean(rating - mu - b_i - b_u - b_g))
+predicted_ratings <- test_set %>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(genre_avgs, by='genres') %>%
+  left_join(date_avgs, by='date') %>%
+  mutate(pred = mu + b_i + b_u + b_g + b_d) %>%
+  .$pred
+if(any(predicted_ratings > 5 | predicted_ratings < 1)){
+  predicted_ratings <- if_else(predicted_ratings > 5,5,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp < first_half_star & predicted_ratings < 1,1,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp >= first_half_star & predicted_ratings < 0.5,0.5,predicted_ratings)
+}
+date_avg_rmse$rmse <- RMSE(test_set$rating,predicted_ratings)
+```
+
+```{r plot0}
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(model=paste("Naive + movie + user + genre + date average"),
+                                     RMSE = date_avg_rmse$rmse[1],
+                                     tuning_param = date_avg_rmse$tuner[1]))
+```
+
+Plotting my tuning results from the 5-fold cross-validation, I see that RMSE is minimized when I stratify by `r date_avg_rmse$tuner[1]`. Therefore, I calculate and sweep out `r date_avg_rmse$tuner[1]`ly residual averages from my training data and then predict ratings in my test set using the formula mu + b_i + b_u + b_g + b_d, with b_d representing my residual weekly averages. This brings RMSE for the cumulative model down a little further, to `r date_avg_rmse$rmse[1]`. In theory, this should be sufficient. But I'd like to further refine the model and to increase my margin of safety before testing on the validation set. Table 1 summarizes the results of the cumulative model.
+
+```{r first_attempt_5, include = TRUE, echo=FALSE}
+rmse_results %>% knitr::kable(caption="Table 1")
+```
+
+### Regularized Model
+
+To refine my base model, I will use a statistical technique called "regularization". Regularization punishes large estimates based on a small sample size by shrinking (dividing) the estimates by some factor lambda. To calculate a regularized average, I sum the ratings and then divide the sum by the number of ratings plus some correction factor lambda. To select a value for lambda, I "tune" lambda with 5-fold cross-validation.
+
+```{r secondattempt1,include=FALSE,echo=FALSE}
+
+#Build Movie Avg model
+
+#Set range of values to try for lambda
+lambdas <- seq(0, 10, 0.25)
+
+#Tune optimal lambda with 5-fold cross validation 
+set.seed(2,sample.kind="Rounding")
+folds <- createFolds(train_set$rating, k = 5, list = TRUE, returnTrain = FALSE)
+
+reg_movie_rmses <- map_dfr(lambdas,function(l){
+  rmse <- map(1:5,function(curr_fold){
+    #Create folds and make sure all movie IDs in tune_set are in tr_set
+    tr_set <- train_set[-folds[[curr_fold]],]
+    temp <- train_set[folds[[curr_fold]],]
+    tune_set <- temp %>% 
+      semi_join(tr_set, by = "movieId")
+    removed <- suppressMessages(anti_join(temp,tune_set))
+    tr_set <- rbind(tr_set, removed)
+    
+    #Sweep out overall average rating and calculate sum of residual averages by
+    #individual movie. Also count n in sample for each movie.
+    #Divide sums by n + lambda to calculate regularized avg.
+    reg_movie_avgs <- tr_set %>% 
+      group_by(movieId) %>% 
+      summarize(s = sum(rating - mu), n = n()) %>%
+      mutate(b_i = s/(n+l))
+    
+    #Add regularized avg to naive avg to predict ratings on tune set
+    predicted_ratings <- tune_set %>% 
+      left_join(reg_movie_avgs, by='movieId') %>% 
+      mutate(pred = mu + b_i) %>%
+      .$pred
+    
+    #Disallow predictions < 0.5 or > 5.0
+    if(any(predicted_ratings > 5 | predicted_ratings < 1)){
+      predicted_ratings <- if_else(predicted_ratings > 5,5,predicted_ratings)
+      predicted_ratings <- if_else(tune_set$timestamp < first_half_star & predicted_ratings < 1,1,predicted_ratings)
+      predicted_ratings <- if_else(tune_set$timestamp >= first_half_star & predicted_ratings < 0.5,0.5,predicted_ratings)
+    }
+    
+    #Return rmse result
+    RMSE(tune_set$rating,predicted_ratings)
+  }) %>% unlist()
+  reg_movie_rmses <- data.frame(lambda = l,rmse = mean(rmse))
+})
+```
+
+```{r plot1,include=TRUE,echo=FALSE}
+#Plot tuning results
+reg_movie_rmses %>% 
+  ggplot(aes(x=lambda,y=rmse)) + 
+  geom_point(shape=1) +
+  ggtitle("Tuning result for regularized movie average correction factor")
+
+#Get optimal tuning parameter
+reg_movie_rmses <- reg_movie_rmses %>%
+  filter(rmse == min(rmse))
+
+#Use our optimal tuning parameter to predict on the test set and save rmse
+reg_movie_avgs <- train_set %>%
+  group_by(movieId) %>% 
+  summarize(s = sum(rating - mu), n = n()) %>%
+  mutate(b_i = s/(n+reg_movie_rmses$lambda[1]))
+predicted_ratings <- test_set %>%
+  left_join(reg_movie_avgs, by='movieId') %>%
+  mutate(pred = mu + b_i) %>%
+  .$pred
+if(any(predicted_ratings > 5 | predicted_ratings < 1)){
+  predicted_ratings <- if_else(predicted_ratings > 5,5,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp < first_half_star & predicted_ratings < 1,1,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp >= first_half_star & predicted_ratings < 0.5,0.5,predicted_ratings)
+}
+reg_movie_rmses$rmse <- RMSE(test_set$rating,predicted_ratings)
+
+#Save RMSE result
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(model="Reg. naive + movie average",
+                                     RMSE = reg_movie_rmses$rmse[1],
+                                     tuning_param = as.character(reg_movie_rmses$lambda[1])))
+```
+
+I begin by regularizing my movie averages. To ensure that I've selected a good range of values to try out for lambda, I plot my tested lambda values against the average RMSE from cross-validation. I see that there is a local minimum at lambda = `r reg_movie_rmses$lambda[1]` and that I'm unlikely to get a different minimum by widening the range of tested lambda values. I choose the value of lambda that minimizes RMSE in the plot, and I use this value of lambda to predict ratings on my test set. The resulting RMSE is `r reg_movie_rmses$rmse[1]`, slightly better than the `r movie_avg_rmse` RMSE result obtained earlier when predicting with a non-regularized movie average in my base model.
+
+```{r secondattempt2,include=TRUE,echo=FALSE}
+#Build User Avg model
+
+#Set range of values to try for lambda
+lambdas <- seq(0, 10, 0.25)
+
+#Tune optimal lambda with 5-fold cross validation 
+set.seed(3,sample.kind="Rounding")
+folds <- createFolds(train_set$rating, k = 5, list = TRUE, returnTrain = FALSE)
+
+reg_user_rmses <- map_dfr(lambdas,function(l){
+  rmse <- map(1:5,function(curr_fold){
+    #Create folds and make sure all user IDs in tune_set are in tr_set
+    tr_set <- train_set[-folds[[curr_fold]],]
+    temp <- train_set[folds[[curr_fold]],]
+    tune_set <- temp %>% 
+      semi_join(tr_set, by = "userId")
+    removed <- suppressMessages(anti_join(temp,tune_set))
+    tr_set <- rbind(tr_set, removed)
+    
+    #Sweep out overall & movie rating and calculate sum of residual averages by
+    #individual user. Also count n in sample for each user.
+    #Divide sums by n + lambda to calculate regularized avg.
+    reg_user_avgs <- tr_set %>% 
+      left_join(reg_movie_avgs, by='movieId') %>%
+      group_by(userId) %>% 
+      summarize(s = sum(rating - mu - b_i), n = n()) %>%
+      mutate(b_u = s/(n+l))
+    
+    #Add regularized avg to naive avg to predict ratings on tune set
+    predicted_ratings <- tune_set %>% 
+      left_join(reg_movie_avgs, by='movieId') %>% 
+      left_join(reg_user_avgs, by='userId') %>%
+      mutate(pred = mu + b_i + b_u) %>%
+      .$pred
+    
+    #Disallow predictions < 0.5 or > 5.0
+    if(any(predicted_ratings > 5 | predicted_ratings < 1)){
+      predicted_ratings <- if_else(predicted_ratings > 5,5,predicted_ratings)
+      predicted_ratings <- if_else(tune_set$timestamp < first_half_star & predicted_ratings < 1,1,predicted_ratings)
+      predicted_ratings <- if_else(tune_set$timestamp >= first_half_star & predicted_ratings < 0.5,0.5,predicted_ratings)
+    }
+    
+    #Return rmse result
+    RMSE(tune_set$rating,predicted_ratings)
+  }) %>% unlist()
+  reg_user_rmses <- data.frame(lambda = l,rmse = mean(rmse))
+})
+```
+
+```{r plot2,include=TRUE,echo=FALSE}
+#Plot tuning results
+reg_user_rmses %>% 
+  ggplot(aes(x=lambda,y=rmse)) + 
+  geom_point(shape=1) +
+  ggtitle("Tuning result for regularized user average correction factor")
+
+#Get optimal tuning parameter
+reg_user_rmses <- reg_user_rmses %>%
+  filter(rmse == min(rmse))
+
+#Predict ratings in the test set with our optimal tuning parameter
+reg_user_avgs <- train_set %>%
+  left_join(reg_movie_avgs, by='movieId') %>%
+  group_by(userId) %>% 
+  summarize(s = sum(rating - mu - b_i), n = n()) %>%
+  mutate(b_u = s/(n+reg_user_rmses$lambda[1]))
+predicted_ratings <- test_set %>% 
+  left_join(reg_movie_avgs, by='movieId') %>% 
+  left_join(reg_user_avgs, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+if(any(predicted_ratings > 5 | predicted_ratings < 1)){
+  predicted_ratings <- if_else(predicted_ratings > 5,5,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp < first_half_star & predicted_ratings < 1,1,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp >= first_half_star & predicted_ratings < 0.5,0.5,predicted_ratings)
+}
+
+#Save RMSE result
+reg_user_rmses$rmse <- RMSE(test_set$rating,predicted_ratings)
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(model="Reg. naive + movie + user average",
+                                     RMSE = reg_user_rmses$rmse[1],
+                                     tuning_param = as.character(reg_user_rmses$lambda[1])))
+```
+
+Repeating the regularization and cross-validation process for my user averages, I plot my tested lambda values and find a local minimum at `r reg_user_rmses$lambda[1]`. Using this value of lambda to predict ratings on my test set, I get an RMSE of `r reg_user_rmses$rmse[1]`, much better than the `r user_avg_rmse` RMSE result previously obtained when predicting ratings with a non-regularized user average in my base model. In fact, with just three regularized averages, I've achieved nearly the same RMSE as the full base model achieved with five.
+
+```{r secondattempt3, include = TRUE, echo=FALSE}
+
+#Build Genre Avg model
+
+#Set range of values to try for lambda
+lambdas <- seq(0, 1000, 25)
+
+#Tune optimal lambda with 5-fold cross validation 
+set.seed(4,sample.kind="Rounding")
+folds <- createFolds(train_set$rating, k = 5, list = TRUE, returnTrain = FALSE)
+
+reg_genre_rmses <- map_dfr(lambdas,function(l){
+  rmse <- map(1:5,function(curr_fold){
+    #Create folds and make sure all genre combos in tune_set are in tr_set
+    tr_set <- train_set[-folds[[curr_fold]],]
+    temp <- train_set[folds[[curr_fold]],]
+    tune_set <- temp %>% 
+      semi_join(tr_set, by = "genres")
+    removed <- suppressMessages(anti_join(temp,tune_set))
+    tr_set <- rbind(tr_set, removed)
+    
+    #Sweep out overall, movie & user rating and calculate sum of residual averages 
+    #by genre combo. Also count n in sample for each genre combo.
+    #Divide sums by n + lambda to calculate regularized avg.
+    reg_genre_avgs <- tr_set %>% 
+      left_join(reg_movie_avgs, by='movieId') %>%
+      left_join(reg_user_avgs, by='userId') %>%
+      group_by(genres) %>% 
+      summarize(s = sum(rating - mu - b_i - b_u), n = n()) %>%
+      mutate(b_g = s/(n+l))
+    
+    #Add regularized avg to naive avg to predict ratings on tune set
+    predicted_ratings <- tune_set %>% 
+      left_join(reg_movie_avgs, by='movieId') %>% 
+      left_join(reg_user_avgs, by='userId') %>%
+      left_join(reg_genre_avgs, by='genres') %>%
+      mutate(pred = mu + b_i + b_u + b_g) %>%
+      .$pred
+    
+    #Disallow predictions < 0.5 or > 5.0
+    if(any(predicted_ratings > 5 | predicted_ratings < 1)){
+      predicted_ratings <- if_else(predicted_ratings > 5,5,predicted_ratings)
+      predicted_ratings <- if_else(tune_set$timestamp < first_half_star & predicted_ratings < 1,1,predicted_ratings)
+      predicted_ratings <- if_else(tune_set$timestamp >= first_half_star & predicted_ratings < 0.5,0.5,predicted_ratings)
+    }
+    
+    #Return rmse result
+    RMSE(tune_set$rating,predicted_ratings)
+  }) %>% unlist()
+  reg_genre_rmses <- data.frame(lambda = l,rmse = mean(rmse))
+})
+```
+
+```{r plot3,include=TRUE,echo=FALSE}
+#Plot tuning results
+ggplot(reg_genre_rmses,aes(x=lambda,y=rmse)) + 
+  geom_point(shape=1) +
+  ggtitle("Tuning result for regularized genre average correction factor")
+
+#Get optimal tuning parameter
+reg_genre_rmses <- reg_genre_rmses %>%
+  filter(rmse == min(rmse))
+
+#Predict ratings in the test set with our optimal tuning parameter
+reg_genre_avgs <- train_set %>%
+  left_join(reg_movie_avgs, by='movieId') %>%
+  left_join(reg_user_avgs, by='userId') %>%
+  group_by(genres) %>% 
+  summarize(s = sum(rating - mu - b_i - b_u), n = n()) %>%
+  mutate(b_g = s/(n+reg_genre_rmses$lambda[1]))
+predicted_ratings <- test_set %>% 
+  left_join(reg_movie_avgs, by='movieId') %>% 
+  left_join(reg_user_avgs, by='userId') %>%
+  left_join(reg_genre_avgs, by='genres') %>%
+  mutate(pred = mu + b_i + b_u + b_g) %>%
+  .$pred
+if(any(predicted_ratings > 5 | predicted_ratings < 1)){
+  predicted_ratings <- if_else(predicted_ratings > 5,5,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp < first_half_star & predicted_ratings < 1,1,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp >= first_half_star & predicted_ratings < 0.5,0.5,predicted_ratings)
+}
+
+#Save RMSE result
+reg_genre_rmses$rmse <- RMSE(test_set$rating,predicted_ratings)
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(model="Reg. naive + movie + user + genre average",
+                                     RMSE = reg_genre_rmses$rmse[1],
+                                     tuning_param = as.character(reg_genre_rmses$lambda[1])))
+```
+
+Extending the regularization method to my genre averages, I find that for this variable, it's necessary to try a much larger range of values for lambda. (That likely means that at this stage of the model I'm seeing less signal and more noise, so I need to be a little more aggressive about tuning out the noise with a higher value of lambda.) I find a local minimum at `r reg_genre_rmses$lambda[1]`. Using this value of lambda to predict ratings on my test set, I get an RMSE of `r reg_genre_rmses$rmse[1]`, substantially better than the `r genre_avg_rmse` RMSE result previously obtained when predicting ratings with a non-regularized genre average in my base model. I'm now officially outperforming my full base model.
+
+```{r secondattempt4, include = TRUE, echo=FALSE}
+#Build Date Avg model
+
+library(lubridate)
+
+#Set range of values to try for lambda
+lambdas <- seq(0, 5000, 100)
+
+#Tune optimal lambda with 5-fold cross validation 
+set.seed(5,sample.kind="Rounding")
+folds <- createFolds(train_set$rating, k = 5, list = TRUE, returnTrain = FALSE)
+
+reg_date_rmses <- map_dfr(lambdas,function(l){
+  rmse <- map(1:5,function(curr_fold){
+    #Create folds and make sure all dates in tune_set are in tr_set
+    tr_set <- train_set[-folds[[curr_fold]],]
+    temp <- train_set[folds[[curr_fold]],]
+    tune_set <- temp %>% 
+      semi_join(tr_set, by = "date")
+    removed <- suppressMessages(anti_join(temp,tune_set))
+    tr_set <- rbind(tr_set, removed)
+    
+    #Sweep out overall, movie, user, & genre rating and calculate sum of residual 
+    #averages by genre combo. Also count n in sample for each genre combo.
+    #Divide sums by n + lambda to calculate regularized avg.
+    reg_date_avgs <- tr_set %>% 
+      left_join(reg_movie_avgs, by='movieId') %>%
+      left_join(reg_user_avgs, by='userId') %>%
+      left_join(reg_genre_avgs, by='genres') %>%
+      group_by(date) %>% 
+      summarize(s = sum(rating - mu - b_i - b_u - b_g), n = n()) %>%
+      mutate(b_d = s/(n+l))
+    
+    #Add regularized avg to naive avg to predict ratings on tune set
+    predicted_ratings <- tune_set %>% 
+      left_join(reg_movie_avgs, by='movieId') %>% 
+      left_join(reg_user_avgs, by='userId') %>%
+      left_join(reg_genre_avgs, by='genres') %>%
+      left_join(reg_date_avgs, by='date') %>%
+      mutate(pred = mu + b_i + b_u + b_g + b_d) %>%
+      .$pred
+    
+    #Disallow predictions < 0.5 or > 5.0
+    if(any(predicted_ratings > 5 | predicted_ratings < 1)){
+      predicted_ratings <- if_else(predicted_ratings > 5,5,predicted_ratings)
+      predicted_ratings <- if_else(tune_set$timestamp < first_half_star & predicted_ratings < 1,1,predicted_ratings)
+      predicted_ratings <- if_else(tune_set$timestamp >= first_half_star & predicted_ratings < 0.5,0.5,predicted_ratings)
+    }
+    
+    #Return rmse result
+    RMSE(tune_set$rating,predicted_ratings)
+  }) %>% unlist()
+  reg_date_rmses <- data.frame(lambda = l,rmse = mean(rmse))
+})
+```
+
+```{r plot4,include=TRUE,echo=FALSE}
+
+#Plot tuning results
+ggplot(reg_date_rmses,aes(x=lambda,y=rmse)) + 
+  geom_point(shape=1) +
+  ggtitle("Tuning result for regularized date average correction factor")
+
+#Get optimal tuning parameter
+reg_date_rmses <- reg_date_rmses %>%
+  filter(rmse == min(rmse))
+
+#Predict ratings in the test set with our optimal tuning parameter
+reg_date_avgs <- train_set %>%
+  left_join(reg_movie_avgs, by='movieId') %>%
+  left_join(reg_user_avgs, by='userId') %>%
+  left_join(reg_genre_avgs, by='genres') %>%
+  group_by(date) %>% 
+  summarize(s = sum(rating - mu - b_i - b_u - b_g), n = n()) %>%
+  mutate(b_d = s/(n+reg_date_rmses$lambda[1]))
+predicted_ratings <- test_set %>% 
+  left_join(reg_movie_avgs, by='movieId') %>% 
+  left_join(reg_user_avgs, by='userId') %>%
+  left_join(reg_genre_avgs, by='genres') %>%
+  left_join(reg_date_avgs, by='date') %>%
+  mutate(pred = mu + b_i + b_u + b_g + b_d) %>%
+  .$pred
+if(any(predicted_ratings > 5 | predicted_ratings < 1)){
+  predicted_ratings <- if_else(predicted_ratings > 5,5,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp < first_half_star & predicted_ratings < 1,1,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp >= first_half_star & predicted_ratings < 0.5,0.5,predicted_ratings)
+}
+
+#Save RMSE result
+reg_date_rmses$rmse <- RMSE(test_set$rating,predicted_ratings)
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(model="Reg. naive + movie + user + genre + date average",
+                                     RMSE = reg_date_rmses$rmse[1],
+                                     tuning_param = as.character(reg_date_rmses$lambda[1])))
+```
+
+Finally, I also regularize my averages by date (again using "week" as my rounding unit as in the base model). Tuning lambda, I find a local minimum at `r reg_date_rmses$lambda[1]`. Using this value of lambda to predict ratings on the test set, I get an RMSE of `r reg_date_rmses$rmse[1]`. This beats both my base model and my target RMSE of 0.86490 by a comfortable margin. Table 2 summarizes the results from my cumulative base model and my cumulative regularized model.
+
+```{r secondattempt5, include = TRUE, echo=FALSE}
+rmse_results %>% knitr::kable(caption="Table 2")
+```
+
+Before calling this model complete, however, I'd like to attempt one last refinement. Can I use loess smoothing on my "date" average to improve my predictions?
+
+To refine my regularized model, I will try smoothing my regularized weekly average ratings with a loess function. To that end, I train a loess model and tune its smoothing span using a 10-fold cross-validation method built into R's caret package. I plot the smoothed model against my regularized weekly averages to visualize the difference between the two prediction methods. The loess model is obviously much less noisy, but it may be *too* smooth. In particular, it appears to underestimate the magnitude of a dip in the data around 1998 and a spike around 2004.
+
+```{r loessmodel,include=FALSE,echo=FALSE}
+#For our continuous date variable, we will try smoothing with a loess model
+
+#Train the model and tune span parameter using 10-fold cross-validation method
+#included in the caret package
+grid <- expand.grid(span=seq(0.05, 1, len = 10),degree=1)
+train_loess <- train(b_d ~ date,
+                     method="gamLoess",
+                     tuneGrid=grid,
+                     data=reg_date_avgs)
+
+#Predict ratings using a combination of regularized averages and loess predictions
+predicted_ratings <- test_set %>%
+  left_join(reg_movie_avgs, by='movieId') %>%
+  left_join(reg_user_avgs, by='userId') %>%
+  left_join(reg_genre_avgs, by='genres') %>%
+  mutate(pred = mu + b_i + b_u + b_g + predict(train_loess,.)) %>%
+  .$pred
+
+#Disallow any predicted ratings < -.5 or > 5.0
+if(any(predicted_ratings > 5 | predicted_ratings < 1)){
+  predicted_ratings <- if_else(predicted_ratings > 5,5,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp < first_half_star & predicted_ratings < 1,1,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp >= first_half_star & predicted_ratings < 0.5,0.5,predicted_ratings)
+}
+
+#Calculate RMSE
+date_loess_rmse <- data.frame(rmse=RMSE(test_set$rating,predicted_ratings),
+                              span=train_loess$bestTune[1])
+```
+
+```{r plot5}
+#Plot the loess model on our date residuals data
+test_set %>%
+  left_join(reg_movie_avgs, by='movieId') %>%
+  left_join(reg_user_avgs, by='userId') %>%
+  left_join(reg_genre_avgs, by='genres') %>%
+  left_join(reg_date_avgs, by='date') %>%
+  group_by(date) %>%
+  summarize(b_d = first(b_d)) %>%
+  mutate(smoother = predict(train_loess,.)) %>%
+  ggplot(aes(x=date)) +
+  geom_point(aes(y=b_d)) +
+  geom_line(aes(y=smoother),col="red") +
+  ggtitle("Weekly regularized averages vs. smoothed loess model") +
+  scale_x_date(date_breaks = "1 year",date_labels = "%Y")
+```
+
+To check this intuition, I use the loess model to predict ratings on the test set in lieu of weekly regularized averages. Sure enough, the model underperforms my weekly regularized averages. The full regularized averages model predicted ratings with an RMSE of `r reg_date_rmses$rmse[1]`, whereas the modified model with loess smoothing predicts with a slightly inferior RMSE of `r date_loess_rmse$rmse[1]`. The results with loess smoothing are summarized in Table 3.
+
+```{r loessresults,include=TRUE,echo=FALSE}
+#Report RMSE
+rmse_results <- bind_rows(rmse_results,
+                          data.frame(model="Reg. naive + movie + user + genre average + date loess model",
+                                     RMSE = date_loess_rmse$rmse[1],
+                                     tuning_param = as.character(date_loess_rmse$span[1])))
+rmse_results %>% knitr::kable(caption="Table 3")
+```
+
+Thus, for this model I reject loess smoothing and use regularized averages instead. Now I'm ready to proceed to validation with my regularized averages model as my final model.
+
+## Results
+
+```{r results,echo=FALSE}
+
+#Add rounded date variable to validation set using optimal tuner
+validation <- validation %>% 
+  mutate(date = round_date(as.Date(as_datetime(timestamp)),unit=date_avg_rmse$tuner[1]))
+
+#Predict ratings in the validation set with our regularization
+reg_date_avgs <- train_set %>%
+  left_join(reg_movie_avgs, by='movieId') %>%
+  left_join(reg_user_avgs, by='userId') %>%
+  left_join(reg_genre_avgs, by='genres') %>%
+  group_by(date) %>% 
+  summarize(s = sum(rating - mu - b_i - b_u - b_g), n = n()) %>%
+  mutate(b_d = s/(n+reg_date_rmses$lambda[1]))
+predicted_ratings <- validation %>% 
+  left_join(reg_movie_avgs, by='movieId') %>% 
+  left_join(reg_user_avgs, by='userId') %>%
+  left_join(reg_genre_avgs, by='genres') %>%
+  left_join(reg_date_avgs, by='date') %>%
+  mutate(pred = mu + b_i + b_u + b_g + b_d) %>%
+  .$pred
+if(any(predicted_ratings > 5 | predicted_ratings < 1)){
+  predicted_ratings <- if_else(predicted_ratings > 5,5,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp < first_half_star & predicted_ratings < 1,1,predicted_ratings)
+  predicted_ratings <- if_else(test_set$timestamp >= first_half_star & predicted_ratings < 0.5,0.5,predicted_ratings)
+}
+
+#Get RMSE result
+validation_result <- RMSE(validation$rating,predicted_ratings)
+```
+
+With final model in hand, I proceed to validation. Using my final, regularized averages model to predict ratings on the validation data set, I get an RMSE of `r validation_result`. This is a little higher than expected based on my testing, but it's below my target threshold of 0.86490. My regularized model is officially a success. 
+
+Surprisingly, achieving an RMSE below 0.86490 proves to be possible with just five regularized averages. It turns out to require no matrix factorization and no attention to the preferences of specific users beyond each user's average rating. I believe that what made this possible is the combination of effective variable tuning (using a process of five-fold cross-validation that I manually coded myself) and forbidding predictions above or below the lowest and highest possible ratings. Indeed, had I failed to notice that the minimum possible rating changed from 1.0 to 0.5 in `r year(as_datetime(first_half_star))`, I probably could not have hit my target RMSE with just five regularized averages.
+
+## Conclusion
+
+This report summarizes a model that predicts movie ratings with surprising accuracy with just a few summary statistics. Just five regularized averages are used in the final model: overall average rating, average rating for each movie, average rating for each user, average rating for each combination of genres, and average rating by week. Each of these averages has been carefully tuned using five-fold cross-validation.
+
+The strength of this model is its simplicity. Its strength is also its main limitation: that it is not especially tailored to individual users. The model predicts movie ratings entirely from population-level information. Future work should look at individual user preferences and pairwise correlations between movies using matrix factorization.
+
+In fact, there's more that could be done even at the population level. A little data exploration leads me to believe the model could be further improved by taking into account the age of a movie at the time of rating. When I extract each movie's release year from the "title" variable and subtract it from the year of rating, I get a measure of how "fresh" or "classic" a movie is. Quickly plotting this "age" variable against the remaining residuals after subtracting my five regularized averages reveals a clear user bias in favor of movies between 0 and 2 years old, and against movies 2 to 13 years old. Users also seem to enjoy "classics" of more than 13 years of age.
+
+```{r finalplot}
+train_set %>%
+  mutate(release_year = str_extract(title,"\\(\\d{4}\\)")) %>%
+  mutate(release_year = str_remove_all(release_year,"[\\(\\)]")) %>%
+  mutate(release_year = as.numeric(release_year)) %>%
+  left_join(reg_date_avgs, by='date') %>%
+  left_join(reg_movie_avgs, by='movieId') %>%
+  left_join(reg_user_avgs, by='userId') %>%
+  left_join(reg_genre_avgs, by='genres') %>%
+  mutate(age = year(date)-release_year) %>%
+  mutate(log_age = round(log2(age)*4)/4) %>%
+  group_by(log_age) %>%
+  summarize(b_a = mean(rating - mu - b_i - b_u - b_g - b_d), n = n()) %>%
+  ggplot(aes(x=log_age,y=b_a)) +
+  geom_hline(yintercept=0,linetype="dashed",col="red") +
+  geom_point(aes(size=n)) +
+  geom_smooth(method="loess") +
+  ylab("residual average rating") +
+  xlab("age of movie at time of rating") +
+  ggtitle("Residual average rating by age of movie at time of rating") +
+  scale_x_continuous(limits=c(0,8),breaks=c(0:7),labels = 2^(0:7))
+```
+
+However, development of a model that uses this information will have to wait for a future study.
