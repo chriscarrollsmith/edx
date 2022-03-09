@@ -1,0 +1,1163 @@
+---
+title: "Forecasting Stock Returns from Historical Price Data"
+author: "Christopher C. Smith"
+date: "3/3/2022"
+output: pdf_document
+---
+
+```{r setup,include=FALSE,echo=TRUE,cache=FALSE}
+#Install any missing required R libraries
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(tidyquant)) install.packages("tidyquant", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+
+#Load required R libraries
+library(tidyverse)
+library(tidyquant)
+library(caret)
+```
+
+## Introduction
+
+In this paper, prepared as a capstone project for the HarvardX "Data Science Professional Certificate" series on <edx.org>, I will build a forecasting model for stock market returns using historical price data. I will limit our analysis to US "large cap" stocks belonging to the S&P 500 stock index, an index of five hundred of the US's largest publicly traded companies. To mitigate survivorship bias, I attempt to include price data not only for companies currently in the index, but also for companies that have been removed from the index. This proves difficult, however, due to the limited availability of data on these companies. For purposes of this analysis, I only forecast prices for a stock during the period(s) of time when it is part of the S&P 500 index. I do not attempt to forecast prices before or after its admission to the index. For removed stocks, the post-removal price is treated as the terminal price of the stock.
+
+My goal in this study will be to use the price information from any given day to forecast returns for the next 21 trading days (1 month) and for the next 253 trading days (1 year). In quantitative finance, there are two common approaches to using past price data to forecast future price data: the "mean reversion" approach and the "momentum" approach. "Mean reversion" traders seek to "buy the dip" on stocks that have experienced a sharp decrease on price, on the expectation that the selling is driven by irrational panic and that the price will rise sharply as the panic subsides. "Momentum" traders, on the other hand, seek to buy stocks that have already made strong price gains, on the assumption that whatever secular tailwinds or intangible advantages have driven a company's prior outperformance will continue to do so. In this study, I will use machine learning to build a model that combines these two approaches to trading. 
+
+A perpetual problem in both approaches is how to *measure* momentum and mean reversion. I will use the historical distribution of a stock price's distance (in percentage terms) from various simple moving averages. For instance, if a stock's price has, on average, traded 1% above its 20-day simple moving average with a 2% standard deviation, then we can use that information to judge whether the stock price on any given day is low or high in its historical distribution. If the stock is trading several standard deviations below or above its mean, then it might be a candidate for a momentum or mean reversion trade.
+
+### Data Acquisition
+
+I have already obtained and pre-processed the data necessary for this analysis and made it available as an R workspace file ("stockreturnscapstone.RData"). To access this data, you may simply place the R workspace file in your working directory and import it with the following code:
+
+```{r import_RData,include=FALSE,echo=TRUE,cache=TRUE,eval=TRUE}
+#Load saved workspace
+load("stockreturnscapstone.RData")
+```
+
+However, to demonstrate the steps by which I obtained and cleaned this data, I will describe the steps and provide the necessary code.
+
+I wanted historical price data for all S&P 500 constituents, both current and former. Fortunately, I was able to easily scrape a list of stock ticker symbols for both current and past index constituents from <https://en.wikipedia.org/wiki/List_of_S%26P_500_companies> using the rvest package. The list of past index constituents appears comprehensive back to 2007. Prior to 2007, the list is spotty. Thus, I will make 2007 the starting point for my analysis.
+
+```{r get_tickers,include=FALSE,echo=TRUE,eval=FALSE}
+#Install and load the rvest package for basic web scraping
+if(!require(rvest)) install.packages("rvest", repos = "http://cran.us.r-project.org")
+library(rvest)
+
+#scrape Wikipedia page for table of current S&P500 tickers
+url <- "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+tickers <- as.data.frame(url %>%
+                           read_html() %>% #pull all HTML from the webpage
+                           html_nodes(xpath = '//*[@id="constituents"]') %>%
+                           html_table()) #get table using XPath
+
+#Keep only symbol and date added columns
+tickers <- tickers %>% 
+  select(symbol = Symbol, date_added = Date.first.added) %>%
+  mutate(date_added = as.Date(date_added))
+
+#replace dots with dashes in select ticker symbols
+tickers$symbol = case_when(
+  tickers$symbol == "BRK.B" ~ "BRK-B",
+  tickers$symbol == "BF.B" ~ "BF-B",
+  #TRUE is equivalent to "else" statement
+  TRUE ~ as.character(tickers$symbol)
+)
+
+#scrape Wikipedia page for table of former S&P500 tickers
+removed_tickers <- as.data.frame(url %>%
+                                   read_html() %>% #pull all HTML from the webpage
+                                   html_nodes(xpath = '//*[@id="changes"]') %>%
+                                   html_table()) #get table using XPath
+
+#Get dates of index removal, identify bankrupt or delisted companies, and remove
+#blank entries from the table
+removed_tickers <- removed_tickers[-1,] %>%
+  mutate(delisted = str_detect(Reason,"bankruptcy|delisted")) %>%
+  select(symbol=Removed,removed_date=Date,delisted) %>%
+  mutate(removed_date = as.Date(removed_date,format="%B %d, %Y")) %>%
+  filter(symbol != "")  %>%
+  filter(removed_date > as.Date("2007-01-01"))
+
+#Find which stocks were added to the index more than once
+removed_twice <- removed_tickers %>% 
+  group_by(symbol) %>% 
+  filter(n()>1) %>%
+  pull(symbol) %>%
+  unique()
+added_twice <- tickers %>%
+  filter(symbol %in% removed_tickers$symbol) %>%
+  pull(symbol)
+
+#Remove Allergan from the list because it wasn't really removed from index; 
+#its name changed
+removed_twice <- removed_twice[!removed_twice %in% c("AGN")]
+removed_tickers <- removed_tickers[-last(which(removed_tickers$symbol == "AGN")),]
+
+#Find how many stocks were added to and removed from the index more than once
+n_added_twice <- length(removed_twice) + length(added_twice)
+
+#Combine the tables of current and former tickers
+sp500tickers <- bind_rows(tickers,removed_tickers)
+```
+
+I will limit my analysis to stocks in the S&P 500 index. Closely examining the Wikipedia list, I immediately run into a problem: `r n_added_twice` stock was removed from the index, added back into the index, and then removed again. Later, for this stock, I will create two duplicate price series—one for the stock's first stint in the index, and another for its second stint. To distinguish the two duplicate series, I will add numbers to the end of the ticker (e.g. "MXIM1" and "MXIM2"). I also find that for many stocks in the index, I am missing the date that the stock was added to the index. This means that for stocks added to the index after 2007, my analysis is going to include some price data from before the stocks were added to the index. Without doing a lot of manual research and data entry, this is unavoidable, and I accept it as a limitation of my data.
+
+Next, I downloaded historical price data for each S&P 500 ticker symbol from the Yahoo! Finance API using the tidyquant package, which is available through CRAN. Of the downloaded data, I keep only the ticker symbol, the date, and the adjusted closing price. (The adjusted closing price variable subtracts dividend payouts from prior historical prices so that the price series for a given stock reflects the stock's total return, including dividends. For the industry standard adjustment methodology as outlined by the Center for Research in Security Prices, see <https://www.crsp.org/products/documentation/crsp-calculations>.)
+
+```{r get_yahoo_data,include=FALSE,echo=TRUE,eval=FALSE}
+#Download historical price data from Yahoo! Finance API
+df_1 <- tq_get(unique(sp500tickers$symbol))
+
+#Keep only the ticker symbol, date, and adjusted closing price
+df_1 <- df_1 %>%
+  select(symbol,date,adjusted)
+
+#Find out which symbols we failed to obtain price data for
+sp500tickers_remaining <- sp500tickers$symbol[!sp500tickers$symbol %in% df_1$symbol]
+```
+
+Unfortunately, the Yahoo! Finance API does not provide price data for delisted stocks. Comparing my downloaded price data to my full list of S&P 500 ticker symbols revealed that I had failed to obtain price data for `r length(sp500tickers_remaining)` of my `r length(unique(sp500tickers$symbol))` ticker symbols. I therefore had to supplement the Yahoo! Finance data with data from another source. I found what I was looking for on Kaggle, uploaded by user Evan Hallmark and downloadable as a .zip archive from  <https://www.kaggle.com/ehallmar/daily-historical-stock-prices-1970-2018>. After downloading the .zip archive, I extracted it to my working directory. It contained two .csv files: one containing price data for thousands of ticker symbols, and the other containing information about each ticker symbol, including the company's full name and sector and industry classification. I imported the price data file into R as a data frame and filtered it to keep only S&P 500 ticker symbols for which I had failed to import data from the Yahoo! Finance API.
+
+```{r read_kaggle_data,include=FALSE,echo=TRUE,eval=FALSE}
+#NOTE: before running the following code, you must manually download and extract
+#archive.zip file from https://www.kaggle.com/ehallmar/daily-historical-stock-prices-1970-2018
+#into your working directory; this will require a free Kaggle account.
+
+#Read Kaggle historical price data from .csv file
+#and change column names & formats to match our Yahoo! Finance data
+df_2 <- read.csv(file = 'historical_stock_prices.csv') %>%
+  select(symbol = ticker,date,adjusted = adj_close) %>%
+  mutate(date = as.Date(date))
+
+#Keep only the ticker symbols for which we failed to get data from Yahoo! Finance
+df_2 <- df_2 %>%
+  filter(symbol %in% sp500tickers_remaining)
+
+#Combine the data from both sources into a single data frame and remove NA values
+df <- bind_rows(df_1,df_2) %>%
+  filter(!is.na(adjusted)) %>% 
+  arrange(symbol,date)
+
+#Find which and how many ticker symbols are still missing from our price data
+sp500tickers_remaining_2 <- unique(sp500tickers$symbol)[!unique(sp500tickers$symbol) %in% df$symbol]
+length(sp500tickers_remaining_2)
+length(unique(sp500tickers$symbol))
+```
+
+Unfortunately, even after importing the Kaggle data, I am still missing historical price data for `r length(sp500tickers_remaining_2)` of the `r length(unique(sp500tickers$symbol))` ticker symbols on my original list. Thus, I tried one more Kaggle data set uploaded by user Boris Marjanovic and downloadable as a .zip archive from  <https://www.kaggle.com/borismarjanovic/price-volume-data-for-all-us-stocks-etfs>. I extracted the data to a "Stocks" folder in my working directory and executed the following code:
+
+```{r read_kaggle_data2,include=FALSE,echo=TRUE,eval=FALSE}
+#NOTE: before running the following code, you must manually download and extract
+#archive.zip file from https://www.kaggle.com/borismarjanovic/price-volume-data-for-all-us-stocks-etfs
+#into a folder titled "Stocks" in your working directory; this will require a 
+#free Kaggle account.
+
+#Read Kaggle historical price data from .csv file
+#and change column names & formats to match our Yahoo! Finance data
+df_3 <- map_dfr(.x=sp500tickers_remaining_2,.f=function(ticker){
+  dat <- tryCatch({read.csv(paste("./Stocks/",tolower(ticker),".us.txt",sep="")) %>%
+      mutate(symbol = ticker,date=as.Date(Date,format="%Y-%m-%d"),adjusted=Close) %>%
+      select(symbol,date,adjusted)},error = function(e){data.frame(ticker=c(),date=c(),adjusted=c())})
+})
+
+#Combine data from all three sources into a single data frame
+df <- bind_rows(df,df_3)
+
+#Find which and how many ticker symbols are still missing from our price data
+sp500tickers_remaining_3 <- unique(sp500tickers$symbol)[!unique(sp500tickers$symbol) %in% df$symbol]
+```
+
+Unfortunately, this data set has prices for only `r length(sp500tickers_remaining_2) - length(sp500tickers_remaining_3)` of my missing ticker symbols; I am still missing historical price data for `r length(sp500tickers_remaining_3)` of the `r length(unique(sp500tickers$symbol))` ticker symbols on my original list.
+
+Ideally I would have liked to find a source of free dividend-adjusted historical price data for the remaining ticker symbols so that they could be included in my analysis, but I was unable to locate one. Access to datasets with prices of delisted stocks generally costs upwards of 500 dollars. Fortunately, close examination of the remaining list of ticker symbols reveals that all but one belong to companies that ended in an acquisition, merger, or spin-off. In other words, these companies didn't fail; they transformed. Thus, they can be excluded from the analysis without too much fear that their exclusion will cause large survivorship bias in my forecasting model. I was, unfortunately, unable to find free historical price data for one company that ended in bankruptcy: Lehman Brothers. This does introduce some survivorship bias. In the scope of this project, with `r length(unique(sp500tickers$symbol)) - length(sp500tickers_remaining_3)` included ticker symbols, hopefully the bias caused by the `r length(sp500tickers_remaining_3)` excluded ticker symbols will be relatively small.
+
+### Data Cleaning
+
+Now that I have acquired my data, I will clean it. First, I will create my duplicate time series for stocks that have done more than one stint in the index since 2007 (i.e., were removed from the index and then added back into the index):
+
+```{r create_dupes,include=FALSE,echo=TRUE,eval=FALSE}
+#Add numbers to the end of tickers that did more than one stint in the index
+redundant_tickers <- map(.x=c(removed_twice,added_twice),.f=function(ticker){
+  sp500tickers$symbol[first(which(sp500tickers$symbol == ticker))] <<- paste(ticker,"2",sep="")
+  sp500tickers$symbol[last(which(sp500tickers$symbol == ticker))] <<- paste(ticker,"1",sep="")
+  ticker
+}) %>% unlist()
+
+#Remove original, redundant, unnumbered tickers
+sp500tickers <- sp500tickers[!sp500tickers$symbol %in% redundant_tickers,]
+
+#Create duplicate time series with numbered tickers in df
+#Arrange ticker symbols alphabetically and dates chronologically
+tmp <- df[df$symbol %in% c(removed_twice,added_twice),]
+tmp$symbol <- paste(  tmp$symbol,"2",sep="")
+df$symbol[df$symbol %in% c(removed_twice,added_twice)] <- paste(
+  df$symbol[df$symbol %in% c(removed_twice,added_twice)],"1",sep="")
+df <- bind_rows(df,tmp) %>%
+  arrange(symbol,date)
+
+#Based on research I performed manually, set the dates on which select stocks were 
+#added to the index
+sp500tickers[str_detect(sp500tickers$symbol,"\\d"),]
+sp500tickers$date_added[sp500tickers$symbol == "MXIM2"] <- as.Date("2018-12-03")
+sp500tickers$date_added[sp500tickers$symbol == "AGN"] <- as.Date("1999-04-12")
+sp500tickers$date_added[sp500tickers$symbol == "OI"] <- as.Date("2009-01-02")
+sp500tickers$date_added[sp500tickers$symbol == "GAS2"] <- as.Date("2011-12-13")
+sp500tickers$date_added[sp500tickers$symbol == "CBE2"] <- as.Date("2011-11-18")
+sp500tickers$date_added[sp500tickers$symbol == "AMD2"] <- as.Date("2017-03-20")
+sp500tickers$date_added[sp500tickers$symbol == "DD2"] <- as.Date("2019-04-02")
+sp500tickers$date_added[sp500tickers$symbol == "TER2"] <- as.Date("2020-09-21")
+sp500tickers[str_detect(sp500tickers$symbol,"\\d"),]
+```
+
+Next, I will remove from my data frame any ticker symbols without in-sample price data. For instance, if the data I acquired is all from a period when the stock was not in the S&P 500, then the data is all out-of-sample and I will delete the ticker symbol from my data frame.
+
+```{r remove_oos,include=FALSE,echo=TRUE,eval=FALSE}
+#Remove tickers from df that were added to index after the end of my data or 
+#removed from the index prior to 2007 or prior to the start of my data
+map(.x=c(unique(df$symbol)),.f=function(ticker){
+  removed <- FALSE
+  if(!is.na(sp500tickers$removed_date[sp500tickers$symbol == ticker])){
+    if(sp500tickers$removed_date[sp500tickers$symbol == ticker] <= as.Date("2007-01-01") | 
+       sp500tickers$removed_date[sp500tickers$symbol == ticker] <= first(df$date[df$symbol == ticker])){
+      df <<- df[df$symbol != ticker,]
+      removed <- TRUE
+    }
+  }
+  if(!is.na(sp500tickers$date_added[sp500tickers$symbol == ticker])){
+    if(sp500tickers$date_added[sp500tickers$symbol == ticker] >= last(df$date[df$symbol == ticker])){
+      df <<- df[df$symbol != ticker,]
+      removed <- TRUE
+    }
+  }
+  removed
+}) %>% unlist() %>% sum()
+```
+
+After excluding out-of-sample data, the total number of S&P 500 ticker symbols for which I have no data rises from `r length(sp500tickers_remaining_3)` to `r length(unique(sp500tickers$symbol)) - length(unique(df$symbol))`. Unofrtunately, this greatly increases the possibility of survivorship bias in my data.
+
+I next filter my data to exclude all data points for each stock that are dated more than one day after the stock's removal from the S&P 500 index:
+
+```{r filter_dates,include=FALSE,echo=TRUE,eval=FALSE}
+#filter out all dates in df more than one day after a stock's removal from the index
+map(.x = sp500tickers$symbol[!is.na(sp500tickers$removed_date)],.f = function(ticker){
+  removed_date <- sp500tickers$removed_date[sp500tickers$symbol == ticker]
+  next_date <- first(df$date[df$symbol == ticker & df$date > removed_date])
+  if(length(next_date == 1)){
+    df <<- df[!(df$date > next_date & df$symbol == ticker),]
+  }
+  ticker
+})
+
+#Get the maximum date found in the 1st Kaggle dataset and see how many of our price
+#series in the df data frame end on this date
+max_date_1 <- max(df_2$date)
+kaggle_cutoff_1 <- df  %>%
+  group_by(symbol) %>%
+  filter(date==last(date))
+kaggle_cutoff_1 <- kaggle_cutoff_1[kaggle_cutoff_1$date == max_date_1,]
+
+#Get the maximum date found in the 2nd Kaggle dataset and see how many of our price
+#series in the df data frame end on this date
+max_date_2 <- max(df_3$date)
+kaggle_cutoff_2 <- df  %>%
+  group_by(symbol) %>%
+  filter(date==last(date))
+kaggle_cutoff_2 <- kaggle_cutoff_2[kaggle_cutoff_2$date == max_date_2,]
+```
+
+A limitation of the data I acquired from Kaggle is that the first data set only includes prices up to `r max_date_1`, and the second data set only includes prices up to `r max_date_2`. Checking the final dates for every ticker symbol to see if any of them are equal to these dates, I find that `r nrow(kaggle_cutoff_1) + nrow(kaggle_cutoff_2)`, price series are indeed truncated at the data set's end date. The truncation of these `r nrow(kaggle_cutoff_1) + nrow(kaggle_cutoff_2)` price series will further exacerbate the survivorship bias caused by the `r length(unique(sp500tickers$symbol)) - length(unique(df$symbol))` ticker symbols that are wholly excluded from the data. This is a real limitation of my data which I unfortunately have not been wholly able to overcome, despite my best efforts. Thus, the conclusions drawn from this study must ultimately be tentative.
+
+As a final step, I check to see whether my data accurately reflects the terminal value of companies delisted from the S&P 500 index. Did any of these companies become untradeable or go to zero when they were removed from the index? In all, there are `r length(sp500tickers$symbol[!is.na(sp500tickers$delisted) & sp500tickers$delisted==TRUE])` companies that went bankrupt or were delisted from their stock exchange at the time of their removal from the index: `r sp500tickers$symbol[!is.na(sp500tickers$delisted) & sp500tickers$delisted==TRUE]`. Of these, the only one we have data for is the PG&E Corporation, with the ticker symbol "PCG". PG&E did not go to zero or become untradeable, and our data set accurately reflects its terminal price of \$`r df$adjusted[df$symbol=="PCG"][df$date[df$symbol=="PCG"]==max(df$date[df$symbol=="PCG"])]` after index removal.
+
+### Data Processing
+
+With my data acquired and cleaned, it's time to process the data and to add my outcome variables and predictors. 
+
+First, for every date in our data set after January 1, 2007, I calculate the return over the next 21 and 253 trading days (1-month and 1-year return). If fewer than 21 or 253 trading days remain until a stock's removal from the index, I calculate the 21-day or 253-day return as difference from terminal value. Because I'm comparing returns over different time periods, I convert 21-day and 253-day returns to compound daily returns (CDRs). These CDR variables are the outcome variables that I will attempt to forecast. 
+
+```{r add_outcome_vars,include=FALSE,echo=TRUE,eval=FALSE}
+#create empty columns for next 21 days and next 253 days % return
+df <- df %>%
+  mutate(return_21 = NA,
+         return_253 = NA)
+
+#populate % return column for each ticker symbol, but only for dates after 01-01-2007
+for(x in unique(df$symbol)){
+  tmp <- df[df$symbol == x & df$date >= as.Date("2007-01-01"),]
+  if(nrow(tmp) > 21){
+    tmp$return_21 <- c((tmp$adjusted[22:nrow(tmp)] - tmp$adjusted[1:(nrow(tmp)-21)])/tmp$adjusted[1:(nrow(tmp)-21)],rep(NA,times=21))
+    df$return_21[df$symbol == x & df$date >= as.Date("2007-01-01")] <- tmp$return_21
+  }
+  if(nrow(tmp) > 253){
+    tmp$return_253 <- c((tmp$adjusted[254:nrow(tmp)] - tmp$adjusted[1:(nrow(tmp)-253)])/tmp$adjusted[1:(nrow(tmp)-253)],rep(NA,times=253))
+    df$return_253[df$symbol == x & df$date >= as.Date("2007-01-01")] <- tmp$return_253
+  }
+}
+
+#Verify that all ticker symbols have at least one non-NA value for 21-day return
+df %>%
+  group_by(symbol) %>%
+  summarize(good = any(!is.na(return_21))) %>%
+  filter(good = FALSE)
+
+#For comparability of returns over different time periods, convert returns to 
+#compound daily returns (CDRs): (ending_value/beginning_value)^(1/days) - 1
+df <- df %>%
+  mutate(cdr_21 = ((adjusted*(1+return_21))/adjusted)^(1/21) - 1,
+         cdr_253 = ((adjusted*(1+return_253))/adjusted)^(1/253) - 1)
+
+#Get a list of symbols whose removal from the index is included in data
+max_date <- max(df$date)
+removed <- df %>%
+  group_by(symbol) %>%
+  summarize(last_date = last(date)) %>%
+  filter(!last_date %in% c(max_date,max_date_1,max_date_2)) %>%
+  pull(symbol)
+sp500tickers[sp500tickers$symbol %in% removed,]
+
+#For these symbols, return for their final days is calculated as difference 
+#from terminal value
+for(x in removed){
+  tmp <- df[df$symbol == x & df$date >= as.Date("2007-01-01"),]
+  terminal_price <- tmp$adjusted[nrow(tmp)]
+  tmp$return_21[(nrow(tmp)-sum(is.na(tmp$return_21))+1):(nrow(tmp)-1)] <- 
+    (terminal_price - tmp$adjusted[(nrow(tmp)-sum(is.na(tmp$return_21))+1):(nrow(tmp)-1)])/tmp$adjusted[(nrow(tmp)-sum(is.na(tmp$return_21))+1):(nrow(tmp)-1)]
+  tmp$return_253[(nrow(tmp)-sum(is.na(tmp$return_253))+1):(nrow(tmp)-1)] <-
+    (terminal_price - tmp$adjusted[(nrow(tmp)-sum(is.na(tmp$return_253))+1):(nrow(tmp)-1)])/tmp$adjusted[(nrow(tmp)-sum(is.na(tmp$return_253))+1):(nrow(tmp)-1)]
+  df[df$symbol == x & df$date >= as.Date("2007-01-01"),] <- tmp
+}
+```
+
+Sometimes, data entry errors in our price series can cause apparently anomalous returns. Searching our data for 21-day returns greater than 600% or less than -85% reveals a few possible problem ticker symbols: "CZR", "GGP", "PENN", "LLL", "CBE2", "NYX", and "TIE". Further exploration of data for these tickers reveals that the data for "CZR", "GGP", and "PENN" is accurate, but that there are errors in the price data for "LLL", "CBE2", "NYX", and "TIE". I thus exclude these ticker symbols from my data.
+
+```{r,include=FALSE,echo=TRUE,eval=FALSE}
+#Examine aberrant returns
+df %>% filter(return_21 > 6 | return_21 < -0.85) %>% View()
+df %>% filter(symbol == "LLL" & between(date,as.Date("2014-12-01"),as.Date("2016-01-01"))) %>% View()
+df %>% filter(symbol == "CBE2" & between(date,as.Date("2012-04-01"),as.Date("2013-01-01"))) %>% View()
+df %>% filter(symbol == "NYX" & between(date,as.Date("2013-11-01"),as.Date("2015-01-01"))) %>% View()
+df %>% filter(symbol == "TIE" & between(date,as.Date("2012-01-01"),as.Date("2012-06-29"))) %>% View()
+
+#Delete tickers with systematic data entry errors
+df <- df %>% filter(!symbol %in% c("TIE","CBE2","LLL","NYX"))
+```
+
+Next, I add several simple moving averages of various lengths (7-day, 20-day, 50-day, 100-day, 200-day, and 500-day). Simple moving averages are averages of some trailing number of data points. They're commonly used for "technical analysis" by stock traders, primarily in identifying trends. I will use them for gauging whether a stock price is low or high relative to its recent history. Thus, I also add variables showing the difference between the current price and each of the simple moving averages.
+
+```{r add_smas,include=FALSE,echo=TRUE,eval=FALSE}
+#filter out NAs and add empty SMA columns
+df <- df %>%
+  group_by(symbol) %>%
+  filter(sum(is.na(adjusted))<2) %>%
+  filter(!is.na(adjusted)) %>%
+  mutate(sma_7 = NA,
+         sma_20 = NA,
+         sma_50 = NA,
+         sma_100 = NA,
+         sma_200 = NA,
+         sma_500 = NA)
+
+#add SMAs
+for(x in unique(df$symbol)){
+  tmp <- df[df$symbol == x,]
+  if(nrow(tmp)>7){
+    tmp$sma_7 <- SMA(tmp$adjusted,n=7)
+    df$sma_7[df$symbol == x] <- tmp$sma_7
+  }
+  if(nrow(tmp)>20){
+    tmp$sma_20 <- SMA(tmp$adjusted,n=20)
+    df$sma_20[df$symbol == x] <- tmp$sma_20
+  }
+  if(nrow(tmp)>50){
+    tmp$sma_50 <- SMA(tmp$adjusted,n=50)
+    df$sma_50[df$symbol == x] <- tmp$sma_50
+  }
+  if(nrow(tmp)>100){
+    tmp$sma_100 <- SMA(tmp$adjusted,n=100)
+    df$sma_100[df$symbol == x] <- tmp$sma_100
+  }
+  if(nrow(tmp)>200){
+    tmp$sma_200 <- SMA(tmp$adjusted,n=200)
+    df$sma_200[df$symbol == x] <- tmp$sma_200
+  }
+  if(nrow(tmp)>500){
+    tmp$sma_500 <- SMA(tmp$adjusted,n=500)
+    df$sma_500[df$symbol == x] <- tmp$sma_500
+  }
+}
+
+#add % distance from SMAs
+df <- df %>%
+  mutate(distance_from_7 = (adjusted - sma_7)/sma_7,
+         distance_from_20 = (adjusted - sma_20)/sma_20,
+         distance_from_50 = (adjusted - sma_50)/sma_50,
+         distance_from_100 = (adjusted - sma_100)/sma_100,
+         distance_from_200 = (adjusted - sma_200)/sma_200,
+         distance_from_500 = (adjusted - sma_500)/sma_500)
+```
+
+Note that the percentage distances from each simple moving average are approximately normally distributed. I illustrate this with a histogram plot. The plot below shows all distances, for all tickers, from the 100-day simple moving average. I could make similar plots for the other moving averages and for individual stocks, though each stock's plot would have its own mean and standard deviation, and the distributions for individual stocks would be noisier and less perfectly normal than the plot below.
+
+```{r plot_distribution,include=TRUE,echo=TRUE,eval=TRUE}
+#Plot distribution of distances to illustrate that they are normally distributed
+df %>%
+  filter(!is.na(distance_from_100) & between(distance_from_100,-1,1)) %>%
+  ggplot(aes(x=distance_from_100)) +
+  geom_histogram(bins=40) +
+  geom_vline(xintercept=mean(df$distance_from_100,na.rm=TRUE)) +
+  scale_x_continuous(limits = c(-1,1),
+                     labels = scales::label_percent()) +
+  labs(title = "Distribution of distances from 100-day SMA",
+       x="Distance from 100-day SMA",
+       y="Count")
+```
+
+Because these distributions are approximately normal, I can convert my percent distances to z-scores. Since I am trying to use past price data to predict the future, I must recalculate the mean and standard deviation for each individual date, using only data that preceded that date. I calculate my z-scores using the historical distributions for individual stocks, recognizing that individual companies have different features and their stock prices have different variability. (Ideally we would do some normalization here, but the calculation of these z-scores is already too computationally intensive.) 
+
+```{r calculate_zscores,include=FALSE,echo=TRUE,eval=FALSE}
+#add empty z-score columns
+df <- df %>%
+  mutate(z_score_7 = NA,
+         z_score_20 = NA,
+         z_score_50 = NA,
+         z_score_100 = NA,
+         z_score_200 = NA,
+         z_score_500 = NA)
+
+#add z-score distance from EMAs, using only data prior to each date
+#WARNING: This code takes a long time to run!
+for(a in 1:nrow(df)){
+  if(df$date[a] >= as.Date("2007-01-01")){
+    tmp <- df[df$symbol == df$symbol[a] & df$date <= df$date[a],]
+    df$z_score_7[a] <- (tmp$distance_from_7[nrow(tmp)] - mean(tmp$distance_from_7,na.rm=T))/sd(tmp$distance_from_7,na.rm=T)
+    df$z_score_20[a] <- (tmp$distance_from_20[nrow(tmp)] - mean(tmp$distance_from_20,na.rm=T))/sd(tmp$distance_from_20,na.rm=T)
+    df$z_score_50[a] <- (tmp$distance_from_50[nrow(tmp)] - mean(tmp$distance_from_50,na.rm=T))/sd(tmp$distance_from_50,na.rm=T)
+    df$z_score_100[a] <- (tmp$distance_from_100[nrow(tmp)] - mean(tmp$distance_from_100,na.rm=T))/sd(tmp$distance_from_100,na.rm=T)
+    df$z_score_200[a] <- (tmp$distance_from_200[nrow(tmp)] - mean(tmp$distance_from_200,na.rm=T))/sd(tmp$distance_from_200,na.rm=T)
+    df$z_score_500[a] <- (tmp$distance_from_500[nrow(tmp)] - mean(tmp$distance_from_500,na.rm=T))/sd(tmp$distance_from_500,na.rm=T)
+  }
+}
+```
+
+Many "mean reversion" traders argue that one should wait until a stock's price "finds a bottom" and begins to level out or move upward before "buying the dip." If this theory is correct, then the z-score on any given date is not the only relevant variable; we also need to know if it has improved over the z-score from previous dates. To assess this, I will add a 20-day moving average for each of my z-scores and calculate the difference between today's z-score and the average of the previous 20 days.
+
+```{r lagged_averages,include=FALSE,echo=TRUE,eval=FALSE}
+#Add 20-day moving averages of the various z-scores
+df_2 <- df %>%
+  filter(sum(!is.na(z_score_7))>20) %>%
+  mutate(zscore_average_7 = SMA(z_score_7,20)) 
+df_3 <- df %>%
+  filter(sum(!is.na(z_score_7))<20)
+df <- bind_rows(df_2,df_3)
+df_2 <- df %>%
+  filter(sum(!is.na(z_score_20))>20) %>%
+  mutate(zscore_average_20 = SMA(z_score_20,20)) 
+df_3 <- df %>%
+  filter(sum(!is.na(z_score_20))<20)
+df <- bind_rows(df_2,df_3)
+df_2 <- df %>%
+  filter(sum(!is.na(z_score_50))>20) %>%
+  mutate(zscore_average_50 = SMA(z_score_50,20)) 
+df_3 <- df %>%
+  filter(sum(!is.na(z_score_50))<20)
+df <- bind_rows(df_2,df_3)
+df_2 <- df %>%
+  filter(sum(!is.na(z_score_100))>20) %>%
+  mutate(zscore_average_100 = SMA(z_score_100,20)) 
+df_3 <- df %>%
+  filter(sum(!is.na(z_score_100))<20)
+df <- bind_rows(df_2,df_3)
+df_2 <- df %>%
+  filter(sum(!is.na(z_score_200))>20) %>%
+  mutate(zscore_average_200 = SMA(z_score_200,20)) 
+df_3 <- df %>%
+  filter(sum(!is.na(z_score_200))<20)
+df <- bind_rows(df_2,df_3)
+df_2 <- df %>%
+  filter(sum(!is.na(z_score_500))>20) %>%
+  mutate(zscore_average_500 = SMA(z_score_500,20)) 
+df_3 <- df %>%
+  filter(sum(!is.na(z_score_500))<20)
+df <- bind_rows(df_2,df_3)
+
+#Find diffs between z-score and 20-day SMA of z-score
+df <- df %>%
+  mutate(diff_7 = z_score_20 - zscore_average_7,
+         diff_20 = z_score_20 - zscore_average_20,
+         diff_50 = z_score_50 - zscore_average_50,
+         diff_100 = z_score_100 - zscore_average_100,
+         diff_200 = z_score_200 - zscore_average_200,
+         diff_500 = z_score_500 - zscore_average_500)
+```
+
+I will also add a few final variables. First, each stock's compound daily return to-date over its lifetime to-date and the total number of days that the stock has traded to-date over its lifetime. I also calculate the average compound daily return (CDR) to-date, although later I will experiment with calculating a normalized version of this average. Second, I also add the total average daily return of all S&P 500 stocks in the data set over their lifetimes to-date. And finally, I will add the average z-score for the whole index for each date, as well each stock's z-score percentile rank (a measure of relative strength).
+
+```{r lifetime_returns,include=FALSE,echo=TRUE,eval=FALSE}
+#Add lifetime daily return to-date for individual stocks and for all stocks
+
+#add empty z-score columns
+df <- df %>%
+  mutate(lifetime_return_to_date = NA,
+         trading_days_to_date = NA)
+
+#Add lifetime return to-date and number of trading days to-date
+for(a in 1:nrow(df)){
+  if(df$date[a] >= as.Date("2007-01-01")){
+    tmp <- df[df$symbol == df$symbol[a] & df$date <= df$date[a],]
+    df$lifetime_return_to_date[a] <- (tmp$adjusted[nrow(tmp)] - tmp$adjusted[1])/tmp$adjusted[1]
+    df$trading_days_to_date[a] <- nrow(tmp)-1
+  }
+}
+
+#Convert lifetime returns to compound daily returns (CDRs): 
+#(ending_value/beginning_value)^(1/days) - 1
+df <- df %>%
+  mutate(lifetime_cdr_to_date = (adjusted/(adjusted/(1+lifetime_return_to_date)))^(1/trading_days_to_date) - 1)
+
+#Add index-level average daily lifetime-to-date return for all stocks in the data set
+sp500 <- df %>%
+  filter(date >= as.Date("2007-01-01")) %>%
+  ungroup() %>%
+  group_by(date) %>%
+  summarize(avg_sp500_cdr_to_date = mean(lifetime_cdr_to_date))
+df <- left_join(df,sp500,by="date")
+
+#Add average z-scores for the entire index for each date
+sp500 <- df %>%
+  filter(date >= as.Date("2007-01-01")) %>%
+  ungroup() %>%
+  group_by(date) %>%
+  summarize(avg_sp500_zscore_7 = mean(z_score_7,na.rm=TRUE),
+            avg_sp500_zscore_20 = mean(z_score_20,na.rm=TRUE),
+            avg_sp500_zscore_50 = mean(z_score_50,na.rm=TRUE),
+            avg_sp500_zscore_100 = mean(z_score_100,na.rm=TRUE),
+            avg_sp500_zscore_200 = mean(z_score_200,na.rm=TRUE),
+            avg_sp500_zscore_500 = mean(z_score_500,na.rm=TRUE))
+df <- left_join(df,sp500,by="date")
+
+#Take average of all z-scores for the stock and the index, add percentile rank
+df <- df %>% 
+  mutate(stock_zscore_avg = (z_score_7 +
+                                   z_score_20 +
+                                   z_score_50 +
+                                   z_score_100 +
+                                   z_score_200 +
+                                   z_score_500)/6,
+         sp500_zscore_avg = (avg_sp500_zscore_7 +
+                                   avg_sp500_zscore_20 +
+                                   avg_sp500_zscore_50 +
+                                   avg_sp500_zscore_100 +
+                                   avg_sp500_zscore_200 +
+                                   avg_sp500_zscore_500)/6) %>%
+  ungroup() %>%
+  group_by(date) %>%
+  mutate(pctrank = rank(stock_zscore_avg)/length(stock_zscore_avg))
+```
+
+
+### Data Partitioning
+
+With predictor variables and outcome variables added to the data frame, I now remove any rows without NA values for my outcome variables (which will include all dates prior to 2007). Then I partition my data into training, testing, and validation sets. My training set contains 80% of the data, while my testing and validation sets each contain 10%. To better simulate the forecasting problem I'm trying to solve (using past data to forecast future data), I don't partition my data randomly. Rather, I partition chronologically. The first 80% of my data goes into the training set, the next 10% into the test set, and the final 10% into the validation set.
+
+```{r partition_data,include=FALSE,echo=TRUE,eval=FALSE}
+#Remove rows with NA returns
+df_tmp <- df %>% 
+  filter(!is.na(return_21))
+nrow(df_tmp)
+
+#Partition for forecasting 21-day return
+# Validation set will be 20% of data
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = df_tmp$return_21, times = 2, p = 0.1, list = FALSE)
+train <- df_tmp[-c(test_index[,1],test_index[,2]),]
+test <- df_tmp[test_index[,1],]
+validate <- df_tmp[test_index[,2],]
+rm(df_tmp)
+```
+
+I also define a function for evaluating the accuracy of my predictions using residual mean squared error (RMSE):
+
+```{r rmse ,include=FALSE,echo=TRUE,eval=FALSE}
+#Define function to get residual mean squared error of predictions
+RMSE <- function(true_return, predicted_return){
+  sqrt(mean((true_return - predicted_return)^2))
+}
+```
+
+As I train my models, I will seek to minimize this RMSE metric.
+
+Finally, I save my workspace as "stockreturnscapstone.RData" to make it easy to load without re-running all this computationally intensive code.
+
+```{r save_workspace,include=FALSE,echo=TRUE,eval=FALSE}
+#Remove unnecessary variables & save workspace as stockreturnscapstone.RData
+rm(df_1,df_2,df_3,df_21,df_253,tmp,terminal_price)
+save.image(file = "stockreturnscapstone.RData")
+```
+
+## Methods
+
+### Data Exploration
+
+I begin with some simple data exploration. First, I examine whether a stock's historical compound daily return has any predictive power for future returns. First I look at correlation coefficients:
+
+```{r data_exploration_0,include=TRUE,echo=TRUE,eval=TRUE}
+#Plot historical CDR against future return
+data.frame(`return 21-day` = cor(train$lifetime_cdr_to_date,train$cdr_21,use="complete.obs"),
+           `return 253-day` = cor(train$lifetime_cdr_to_date,train$cdr_253,use="complete.obs")) %>% 
+  knitr::kable(caption="Correlation coefficients for historical CDR vs. future CDR")
+```
+
+Both correlation coefficients are positive, but both are small, and the coefficient for 21-day return is basically indistinguishable from noise. We can also stratify by historical CDR and see that there does appear to be a positive relationship, though the data are very noisy:
+
+```{r data_exploration_01,include=TRUE,echo=TRUE,eval=TRUE}
+#Plot historical CDR against future return
+facet_plot <- train %>% 
+  ungroup() %>%
+  mutate(historical_cdr = round(lifetime_cdr_to_date*10000)/10000) %>%
+  group_by(historical_cdr) %>%
+  summarize(mean_cdr_21 = mean(cdr_21),
+            mean_cdr_253 = mean(cdr_253,na.rm=TRUE),
+            n=n()) %>%
+  filter(n>20000)
+facet_plot <- gather(facet_plot,duration,cdr,2:3)
+facet_plot$duration[facet_plot$duration == "mean_cdr_21"] <- "21-day CDR"
+facet_plot$duration[facet_plot$duration == "mean_cdr_253"] <- "253-day CDR"
+facet_plot %>%
+  ggplot(aes(x=historical_cdr,y=cdr,col=duration)) +
+  geom_line() +
+  geom_point(aes(size=n)) +
+  labs(title="Historical compound daily return vs. next 21-days and 253-days compound daily return",
+       x="Historical compound daily return",
+       y="Next period compound daily return")
+```
+
+Next, I explore the data to see if there's any evidence for a mean reversion or momentum effect, as measured by z-score. First, I calculate simple correlation coefficients:
+
+```{r data_exploration_1,include=TRUE,echo=TRUE,eval=TRUE}
+#calculate correlation coefficients for z-score vs. 21-day cdr
+data.frame(z_score_7 = cor(train$z_score_7,train$cdr_21,use="complete.obs"),
+           z_score_20 = cor(train$z_score_20,train$cdr_21,use="complete.obs"),
+           z_score_50 = cor(train$z_score_50,train$cdr_21,use="complete.obs"),
+           z_score_100 = cor(train$z_score_100,train$cdr_21,use="complete.obs"),
+           z_score_200 = cor(train$z_score_200,train$cdr_21,use="complete.obs"),
+           z_score_500 = cor(train$z_score_500,train$cdr_21,use="complete.obs")) %>% 
+  knitr::kable(caption="Correlation coefficients for z-score vs. 21-day return")
+
+#calculate correlation coefficients  for z-score vs. 253-day return
+data.frame(z_score_7 = cor(train$z_score_7,train$cdr_253,use="complete.obs"),
+           z_score_20 = cor(train$z_score_20,train$cdr_253,use="complete.obs"),
+           z_score_50 = cor(train$z_score_50,train$cdr_253,use="complete.obs"),
+           z_score_100 = cor(train$z_score_100,train$cdr_253,use="complete.obs"),
+           z_score_200 = cor(train$z_score_200,train$cdr_253,use="complete.obs"),
+           z_score_500 = cor(train$z_score_500,train$cdr_253,use="complete.obs")) %>% 
+  knitr::kable(caption="Correlation coefficients for z-score vs. 253-day return")
+```
+
+It appears that z-score is negatively correlated with mean return for all moving averages. This provides evidence for a "mean reversion" effect and for the strategy of "buying the dip." But is a linear model the best model for this relationship? To find out, I stratify my data by z-score and create a few test plots of mean return (with 95% confidence interval) by z-score stratum for different moving averages:
+
+```{r data_exploration_2,include=TRUE,echo=TRUE,eval=TRUE}
+#stratify by z-score and plot mean and 95% CI for return for each stratum
+facet_plot <- train %>%
+  ungroup() %>%
+  mutate(`7-day moving average` = round(z_score_7),
+         `20-day moving average` = round(z_score_20),
+         `50-day moving average` = round(z_score_50),
+         `100-day moving average` = round(z_score_100),
+         `200-day moving average` = round(z_score_200),
+         `500-day moving average` = round(z_score_500)) %>%
+  select(`7-day moving average`,`20-day moving average`,`50-day moving average`,
+         `100-day moving average`,`200-day moving average`,`500-day moving average`,cdr_21)
+facet_plot <- gather(facet_plot,moving_average,z_score,1:6) %>%
+  mutate(moving_average = factor(moving_average,levels=c("7-day moving average",
+                                                         "20-day moving average",
+                                                         "50-day moving average",
+                                                         "100-day moving average",
+                                                         "200-day moving average",
+                                                         "500-day moving average"))) %>%
+  group_by(moving_average,z_score) %>%
+  summarize(n = n(),
+            mean_return = mean(cdr_21),
+            se_return = sd(cdr_21)/sqrt(n)) %>% 
+  filter(between(z_score,-8,8)) 
+facet_plot %>%
+  ggplot(aes(x=z_score,y=mean_return)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(aes(yintercept=0),linetype=2) +
+  geom_errorbar(aes(ymin = mean_return - 2*se_return, ymax = mean_return + 2*se_return)) +
+  labs(title = "Mean return by z-score distance from various simple moving averages",
+       x="Z-score stratum",
+       y="Mean return") + 
+  scale_y_continuous(limits = c(-.03,.02)) +
+  facet_wrap( ~ moving_average)
+```
+
+Here I find strong evidence for a "mean reversion" effect on both the upside and the downside; stocks that move too far from their moving averages tend to move decisively back toward those averages in my data. I also find weaker evidence for a "momentum" effect, particularly on the 100-day and 200-day moving average plots. Stocks priced 5 standard deviations above their historical mean in relationship to these two moving averages tend to enjoy outsize returns over the next 21 days. 
+
+Repeating this analysis for 253-day return, I find much stronger evidence for a momentum effect on this longer timeline:
+
+```{r data_exploration_3,include=TRUE,echo=TRUE,eval=TRUE}
+#Recreate the above plot for 253-day return
+
+#stratify by z-score and plot mean and 95% CI for return for each stratum
+facet_plot <- train %>%
+  ungroup() %>%
+  filter(!is.na(return_253)) %>%
+  mutate(`7-day moving average` = round(z_score_7),
+         `20-day moving average` = round(z_score_20),
+         `50-day moving average` = round(z_score_50),
+         `100-day moving average` = round(z_score_100),
+         `200-day moving average` = round(z_score_200),
+         `500-day moving average` = round(z_score_500)) %>%
+  select(`7-day moving average`,`20-day moving average`,`50-day moving average`,
+         `100-day moving average`,`200-day moving average`,`500-day moving average`,cdr_253)
+facet_plot <- gather(facet_plot,moving_average,z_score,1:6) %>%
+  mutate(moving_average = factor(moving_average,levels=c("7-day moving average",
+                                                         "20-day moving average",
+                                                         "50-day moving average",
+                                                         "100-day moving average",
+                                                         "200-day moving average",
+                                                         "500-day moving average"))) %>%
+  group_by(moving_average,z_score) %>%
+  summarize(n = n(),
+            mean_return = mean(cdr_253),
+            se_return = sd(cdr_253)/sqrt(n)) %>% 
+  filter(between(z_score,-5,5)) 
+facet_plot %>%
+  ggplot(aes(x=z_score,y=mean_return)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(aes(yintercept=0),linetype=2) +
+  geom_errorbar(aes(ymin = mean_return - 2*se_return, ymax = mean_return + 2*se_return)) +
+  labs(title = "Mean return by z-score distance from various simple moving averages",
+       x="Z-score stratum",
+       y="Mean return") + 
+  scale_y_continuous() +
+  facet_wrap( ~ moving_average)
+```
+
+Thus, while an elevated z-score may tend to be followed by "mean reversion" to the downside on a one-month timeframe, it tends to create momentum to the upside on a one-year timeframe. 
+
+Obviously, it does not appear that a linear model would capture the shape of our data very well. This, I will lean toward more granular models like loess and k-nearest neighbors.
+
+What about our simple moving average of z-score for the last 20 days? Does this variable have predictive power? And can the difference between today's z-score and the last 20 days z-score tell us anything useful? To find out, I try double-stratifying my data by the 20-day average and the difference from today's z-score:
+
+```{r data_exploration_4,include=TRUE,echo=TRUE,eval=TRUE}
+#Double stratify 20-day moving average of z-score and its difference from same-day z-score
+#and create a heat map showing 21-day return
+facet_plot <- train %>% 
+  ungroup() %>%
+  mutate(`7-day moving average avg` = round(zscore_average_7),
+         `20-day moving average avg` = round(zscore_average_20),
+         `50-day moving average avg` = round(zscore_average_50),
+         `100-day moving average avg` = round(zscore_average_100),
+         `200-day moving average avg` = round(zscore_average_200),
+         `500-day moving average avg` = round(zscore_average_500)) %>%
+  mutate(`7-day moving average` = round(diff_7),
+         `20-day moving average` = round(diff_20),
+         `50-day moving average` = round(diff_50),
+         `100-day moving average` = round(diff_100),
+         `200-day moving average` = round(diff_200),
+         `500-day moving average` = round(diff_500)) %>%
+  select(`7-day moving average avg`,`20-day moving average avg`,`50-day moving average avg`,
+         `100-day moving average avg`,`200-day moving average avg`,`500-day moving average avg`,
+         `7-day moving average`,`20-day moving average`,
+         `50-day moving average`,`100-day moving average`,
+         `200-day moving average`,`500-day moving average`,
+         cdr_21,cdr_253)
+facet_plot <- gather(facet_plot,moving_average,ma_z_score,1:6)
+facet_plot <- gather(facet_plot,moving_average,diff_z_score,1:6) %>%
+  mutate(moving_average = factor(moving_average,levels=c("7-day moving average",
+                                                         "20-day moving average",
+                                                         "50-day moving average",
+                                                         "100-day moving average",
+                                                         "200-day moving average",
+                                                         "500-day moving average"))) 
+facet_plot <- facet_plot %>%
+  group_by(moving_average,ma_z_score,diff_z_score) %>%
+  summarize(n = n(),
+            mean_return = mean(cdr_21),
+            se_return = sd(cdr_21)/sqrt(n)) %>% 
+  filter(between(ma_z_score,-8,8) & between(diff_z_score,-8,8)) 
+facet_plot %>%
+  ggplot(aes(x=ma_z_score,y=diff_z_score,fill=mean_return)) +
+  geom_tile() +
+  geom_hline(aes(yintercept=0),linetype=2) +
+  geom_vline(aes(xintercept=0),linetype=2) +
+  labs(title = "Mean 21-day return by z-score distance from various simple moving averages",
+       x="Trailing 20-day average of z-score",
+       y="Today's z-score difference from 20-day average") + 
+  scale_fill_gradient(low="red",high="green") +
+  facet_wrap( ~ moving_average)
+
+#Double stratify 20-day moving average of z-score and its difference from same-day z-score
+#and create a heat map showing 253-day return
+facet_plot <- train %>% 
+  filter(!is.na(cdr_253)) %>%
+  ungroup() %>%
+  mutate(`7-day moving average avg` = round(zscore_average_7),
+         `20-day moving average avg` = round(zscore_average_20),
+         `50-day moving average avg` = round(zscore_average_50),
+         `100-day moving average avg` = round(zscore_average_100),
+         `200-day moving average avg` = round(zscore_average_200),
+         `500-day moving average avg` = round(zscore_average_500)) %>%
+  mutate(`7-day moving average` = round(diff_7),
+         `20-day moving average` = round(diff_20),
+         `50-day moving average` = round(diff_50),
+         `100-day moving average` = round(diff_100),
+         `200-day moving average` = round(diff_200),
+         `500-day moving average` = round(diff_500)) %>%
+  select(`7-day moving average avg`,`20-day moving average avg`,`50-day moving average avg`,
+         `100-day moving average avg`,`200-day moving average avg`,`500-day moving average avg`,
+         `7-day moving average`,`20-day moving average`,
+         `50-day moving average`,`100-day moving average`,
+         `200-day moving average`,`500-day moving average`,
+         cdr_21,cdr_253)
+facet_plot <- gather(facet_plot,moving_average,ma_z_score,1:6)
+facet_plot <- gather(facet_plot,moving_average,diff_z_score,1:6) %>%
+  mutate(moving_average = factor(moving_average,levels=c("7-day moving average",
+                                                         "20-day moving average",
+                                                         "50-day moving average",
+                                                         "100-day moving average",
+                                                         "200-day moving average",
+                                                         "500-day moving average"))) 
+facet_plot <- facet_plot %>%
+  group_by(moving_average,ma_z_score,diff_z_score) %>%
+  summarize(n = n(),
+            mean_return = mean(cdr_253),
+            se_return = sd(cdr_253)/sqrt(n)) %>% 
+  filter(between(ma_z_score,-8,8) & between(diff_z_score,-8,8)) 
+facet_plot %>%
+  ggplot(aes(x=ma_z_score,y=diff_z_score,fill=mean_return)) +
+  geom_tile() +
+  geom_hline(aes(yintercept=0),linetype=2) +
+  geom_vline(aes(xintercept=0),linetype=2) +
+  labs(title = "Mean 253-day return by z-score distance from various simple moving averages",
+       x="Trailing 20-day average of z-score",
+       y="Today's z-score difference from 20-day average") + 
+  scale_fill_gradient(low="red",high="green") +
+  facet_wrap( ~ moving_average)
+```
+
+These heatmaps do offer some reason for optimism about using these two variables in combination, but they may prove difficult to operationalize in a predictive model.
+
+### Building a forecasting model
+
+As a baseline to compare against, I estimate the RMSE of forecasting a CDR of zero for all data points in my test set.
+
+```{r zero_forecast,include=TRUE,echo=TRUE,eval=TRUE}
+#Calculate RMSE using a forecast of zero for all CDR values in test set
+actual_21 <- test$cdr_21
+actual_253 <- test$cdr_253[!is.na(test$cdr_253)]
+model_rmses <- data.frame(model = "Zero",rmse_21_day = RMSE(actual_21,0),rmse_253_day = RMSE(actual_253,0))
+model_rmses %>% 
+  knitr::kable(caption="Model RMSEs")
+```
+
+As an initial step in building a forecasting model, I use average CDR for the entire index to-date. Because of the restriction that I can only use past data as a predictor, I don't use exactly the same average for all of my predictions. The mean value used is `r mean(train$avg_sp500_cdr_to_date)`, and the standard deviation of the values used is `r sd(train$avg_sp500_cdr_to_date)`. To use such a wide range of values is sub-optimal, and the value would be more stable if I had more historical data, but I work with what I have.
+
+```{r mean_cdr_of_index,include=TRUE,echo=TRUE,eval=TRUE}
+#Calculate RMSE using average S&P 500 CDR to-date
+forecast_21 <- test$avg_sp500_cdr_to_date
+forecast_253 <- test$avg_sp500_cdr_to_date[!is.na(test$cdr_253)]
+model_rmses <- bind_rows(model_rmses,data.frame(model = "Mean S&P 500 CDR to-date",rmse_21_day = RMSE(actual_21,forecast_21),rmse_253_day = RMSE(actual_253,forecast_253)))  
+model_rmses %>% 
+  knitr::kable(caption="Model RMSEs")
+```
+
+Using the index mean slightly improves accuracy over using zero. So far, so good. Next, I will try using the mean CDR to-date for each individual stock.
+
+```{r mean_cdr_of_stock,include=TRUE,echo=TRUE,eval=TRUE}
+#Calculate RMSE using individual stock's average CDR to-date
+forecast_21 <- test$lifetime_cdr_to_date
+forecast_253 <- test$lifetime_cdr_to_date[!is.na(test$cdr_253)]
+model_rmses <- bind_rows(model_rmses,data.frame(model = "Individual stock mean CDR to-date",rmse_21_day = RMSE(actual_21,forecast_21),rmse_253_day = RMSE(actual_253,forecast_253)))  
+model_rmses %>% 
+  knitr::kable(caption="Model RMSEs")
+```
+
+This is less accurate than using either zero or the average for the index. It's possible that I could improve this approach using regularization to regress it toward the index average for stocks with a small number of historical data points. To test this, I use five-fold cross-validation to tune a correction factor (lambda) on my training set. I then average the rmse from each of the five folds for each tested value of lambda, and I plot the results: 
+
+```{r regularized_mean_cdr_of_stock,include=TRUE,echo=TRUE,eval=TRUE}
+#Attempt to forecast using regularization & five-fold cross-validation for tuning
+#Set range of values to try for lambda
+lambda <- seq(1, 4000, 50)
+
+#Create folds for 5-fold cross validation to tune lambda
+set.seed(1,sample.kind="Rounding")
+folds <- createFolds(train$cdr_21, k = 5, list = TRUE, returnTrain = FALSE)
+
+#Perform a five-fold cross-validation to tune lambda
+lambdas <- map_dfr(.x=1:5,.f=function(curr_fold){
+  #Create fold
+  tune_set <- train[folds[[curr_fold]],]
+  
+  #See which value of lambda minimizes RMSE when predicting on tune_set
+  lambdas <- map_dfr(.x=lambda,.f=function(lambda){
+    
+    #sweep out S&P 500 averages from the actuals
+    actual_21 <- tune_set$cdr_21 - tune_set$avg_sp500_cdr_to_date
+    actual_21 <- actual_21[!is.na(tune_set$cdr_21)]
+    actual_253 <- tune_set$cdr_253 - tune_set$avg_sp500_cdr_to_date
+    actual_253 <- actual_253[!is.na(tune_set$cdr_253)]
+    
+    #sweep out S&P 500 averages from the forecasts
+    forecast_21 <- ((tune_set$adjusted/(tune_set$adjusted/(1+tune_set$lifetime_return_to_date)))^(1/(tune_set$trading_days_to_date + lambda)) - 1) - tune_set$avg_sp500_cdr_to_date
+    forecast_21 <- forecast_21[!is.na(tune_set$cdr_21)]
+    forecast_253 <- ((tune_set$adjusted/(tune_set$adjusted/(1+tune_set$lifetime_return_to_date)))^(1/(tune_set$trading_days_to_date + lambda)) - 1) - tune_set$avg_sp500_cdr_to_date
+    forecast_253 <- forecast_253[!is.na(tune_set$cdr_253)]
+    
+    #calculate rmses
+    rmses <- data.frame(fold = curr_fold,lambda,rmse_21_day = RMSE(actual_21,forecast_21),rmse_253_day = RMSE(actual_253,forecast_253))
+  })
+})
+
+#Average rmses over the five folds
+lambdas <- lambdas %>%
+  group_by(lambda) %>%
+  summarize(rmse_21_day = mean(rmse_21_day),rmse_253_day = mean(rmse_253_day))
+
+#Plot values of lambda against rmses
+lambdas <- gather(lambdas,cdr,rmse,2:3)
+lambdas$cdr[lambdas$cdr == "rmse_21_day"] <- "21-day CDR"
+lambdas$cdr[lambdas$cdr == "rmse_253_day"] <- "253-day CDR"
+lambdas %>% ggplot(aes(x=lambda,y=rmse)) + 
+  geom_point() +
+  facet_wrap( ~ cdr,scales="free") +
+  labs(title = "Tuning results for correction factor lambda")
+
+#Get value of lambda that minimizes RMSE
+lambda <- lambdas %>%
+  filter(cdr=="253-day CDR") %>% 
+  filter(rmse == min(rmse)) %>%
+  pull(lambda)
+
+```
+
+RMSE is minimized with a correction factor of `r lambda`. When we apply this correction factor to get a regularized mean lifetime CDR for each stock and then use this (in combination with the S&P 500 mean) to predict CDR for the test set, we find that, indeed, RMSE improves over the previous models:
+
+```{r forecast_with_reg_mean_cdr,include=TRUE,echo=TRUE,eval=TRUE}
+#use the best value of lambda to forecast on the test set and calculate RMSE
+#sweep out S&P 500 averages from the actuals
+actual_21 <- test$cdr_21 - test$avg_sp500_cdr_to_date
+actual_21 <- actual_21[!is.na(test$cdr_21)]
+actual_253 <- test$cdr_253 - test$avg_sp500_cdr_to_date
+actual_253 <- actual_253[!is.na(test$cdr_253)]
+
+#sweep out S&P 500 averages from the forecasts
+forecast_21 <- ((test$adjusted/(test$adjusted/(1+test$lifetime_return_to_date)))^(1/(test$trading_days_to_date + lambda)) - 1) - test$avg_sp500_cdr_to_date
+forecast_21 <- forecast_21[!is.na(test$cdr_21)]
+forecast_253 <- ((test$adjusted/(test$adjusted/(1+test$lifetime_return_to_date)))^(1/(test$trading_days_to_date + lambda)) - 1) - test$avg_sp500_cdr_to_date
+forecast_253 <- forecast_253[!is.na(test$cdr_253)]
+
+#calculate rmses
+model_rmses <- bind_rows(model_rmses,data.frame(model = "Individual stock regularized mean CDR to-date",rmse_21_day = RMSE(actual_21,forecast_21),rmse_253_day = RMSE(actual_253,forecast_253))) 
+model_rmses %>% 
+  knitr::kable(caption="Model RMSEs")
+```
+
+Finally, I try training a loess model using z-score distance from various moving averages. Unfortunately, this model is too computationally intensive to train on the entire data set. Instead, I stratify the data in much the same way I did during data exploration, and I fit my loess model to the stratified data.
+
+```{r loess_model,include=TRUE,echo=TRUE,eval=TRUE}
+#sweep out averages and stratify by z-score
+train_loess <- train %>%
+  ungroup() %>%
+  mutate(`7-day moving average` = round(z_score_7),
+         `20-day moving average` = round(z_score_20),
+         `50-day moving average` = round(z_score_50),
+         `100-day moving average` = round(z_score_100),
+         `200-day moving average` = round(z_score_200),
+         `500-day moving average` = round(z_score_500)) 
+train_loess$swept_21 <- train_loess$cdr_21 - ((train_loess$adjusted/(train_loess$adjusted/(1+train_loess$lifetime_return_to_date)))^(1/(train_loess$trading_days_to_date + lambda)) - 1) - train_loess$avg_sp500_cdr_to_date
+train_loess$swept_253 <- train_loess$cdr_253 - ((train_loess$adjusted/(train_loess$adjusted/(1+train_loess$lifetime_return_to_date)))^(1/(train_loess$trading_days_to_date + lambda)) - 1) - train_loess$avg_sp500_cdr_to_date
+train_loess <- train_loess %>% select(`7-day moving average`,`20-day moving average`,`50-day moving average`,
+         `100-day moving average`,`200-day moving average`,`500-day moving average`,swept_21)
+train_loess <- gather(train_loess,moving_average,z_score,1:6) 
+train_loess <- train_loess %>% mutate(moving_average = factor(moving_average,levels=c("7-day moving average",
+                                                         "20-day moving average",
+                                                         "50-day moving average",
+                                                         "100-day moving average",
+                                                         "200-day moving average",
+                                                         "500-day moving average"))) %>%
+  group_by(moving_average,z_score) %>%
+  summarize(n = n(),
+            mean_return = mean(swept_21),
+            se_return = sd(swept_21)/sqrt(n))
+
+#Plot all moving average zscores on the same chart and run an experimental loess fit
+train_loess %>%
+  ggplot(aes(x=z_score,y=mean_return)) +
+  geom_point() +
+  geom_smooth(span=.3) +
+  labs(title = "Mean return by z-score distance from various simple moving averages",
+       x="Z-score stratum",
+       y="Mean return") + 
+  scale_y_continuous(limits = c(-.03,.02))
+
+#Fit a loess model
+loess_model <- loess(mean_return ~ z_score,data=train_loess,span = .3)
+
+#Predict returns for test data set using loess model
+test_loess <- test %>% ungroup()
+test_loess$swept_21 <- test_loess$cdr_21 - ((test_loess$adjusted/(test_loess$adjusted/(1+test_loess$lifetime_return_to_date)))^(1/(test_loess$trading_days_to_date + lambda)) - 1) - test_loess$avg_sp500_cdr_to_date
+test_loess$swept_253 <- test_loess$cdr_253 - ((test_loess$adjusted/(test_loess$adjusted/(1+test_loess$lifetime_return_to_date)))^(1/(test_loess$trading_days_to_date + lambda)) - 1) - test_loess$avg_sp500_cdr_to_date
+test_loess <- test_loess %>%
+  mutate(average_z_score = (z_score_7+z_score_20+z_score_50+z_score_100+z_score_200+z_score_500)/6)
+test_loess <- test_loess %>% select(swept_21,z_score = average_z_score)
+test_loess <- test_loess %>% drop_na()
+test_loess$forecast <- predict(loess_model,test_loess)
+model_rmses <- bind_rows(model_rmses,data.frame(model = "Loess model",rmse_21_day = RMSE(test_loess$swept_21,test_loess$forecast),rmse_253_day=NA))
+                
+
+#Repeat the above analysis for 253-day return
+#sweep out averages and stratify by z-score
+train_loess <- train %>%
+  ungroup() %>%
+  mutate(`7-day moving average` = round(z_score_7),
+         `20-day moving average` = round(z_score_20),
+         `50-day moving average` = round(z_score_50),
+         `100-day moving average` = round(z_score_100),
+         `200-day moving average` = round(z_score_200),
+         `500-day moving average` = round(z_score_500)) 
+train_loess$swept_21 <- train_loess$cdr_21 - ((train_loess$adjusted/(train_loess$adjusted/(1+train_loess$lifetime_return_to_date)))^(1/(train_loess$trading_days_to_date + lambda)) - 1) - train_loess$avg_sp500_cdr_to_date
+train_loess$swept_253 <- train_loess$cdr_253 - ((train_loess$adjusted/(train_loess$adjusted/(1+train_loess$lifetime_return_to_date)))^(1/(train_loess$trading_days_to_date + lambda)) - 1) - train_loess$avg_sp500_cdr_to_date
+train_loess <- train_loess %>% select(`7-day moving average`,`20-day moving average`,`50-day moving average`,
+                                      `100-day moving average`,`200-day moving average`,`500-day moving average`,swept_253) %>%
+  filter(!is.na(swept_253))
+train_loess <- gather(train_loess,moving_average,z_score,1:6) 
+train_loess <- train_loess %>% mutate(moving_average = factor(moving_average,levels=c("7-day moving average",
+                                                                                      "20-day moving average",
+                                                                                      "50-day moving average",
+                                                                                      "100-day moving average",
+                                                                                      "200-day moving average",
+                                                                                      "500-day moving average"))) %>%
+  group_by(moving_average,z_score) %>%
+  summarize(n = n(),
+            mean_return = mean(swept_253),
+            se_return = sd(swept_253)/sqrt(n))
+
+#Plot all moving average zscores on the same chart and run an experimental loess fit
+train_loess %>%
+  ggplot(aes(x=z_score,y=mean_return)) +
+  geom_point() +
+  geom_smooth(span=.3) +
+  labs(title = "Mean return by z-score distance from various simple moving averages",
+       x="Z-score stratum",
+       y="Mean return") + 
+  scale_y_continuous(limits = c(-.03,.02))
+
+#Fit a loess model
+loess_model <- loess(mean_return ~ z_score,data=train_loess,span = .3)
+
+#Predict returns for test data set using loess model
+test_loess <- test %>% ungroup()
+test_loess$swept_21 <- test_loess$cdr_21 - ((test_loess$adjusted/(test_loess$adjusted/(1+test_loess$lifetime_return_to_date)))^(1/(test_loess$trading_days_to_date + lambda)) - 1) - test_loess$avg_sp500_cdr_to_date
+test_loess$swept_253 <- test_loess$cdr_253 - ((test_loess$adjusted/(test_loess$adjusted/(1+test_loess$lifetime_return_to_date)))^(1/(test_loess$trading_days_to_date + lambda)) - 1) - test_loess$avg_sp500_cdr_to_date
+test_loess <- test_loess %>%
+  mutate(average_z_score = (z_score_7+z_score_20+z_score_50+z_score_100+z_score_200+z_score_500)/6)
+test_loess <- test_loess %>% select(swept_253,z_score = average_z_score)
+test_loess <- test_loess %>% drop_na()
+test_loess$forecast <- predict(loess_model,test_loess)
+model_rmses$rmse_253_day[nrow(model_rmses)] <- RMSE(test_loess$swept_253,test_loess$forecast) 
+model_rmses %>% 
+  knitr::kable(caption="Model RMSEs")
+                         
+```
+
+This method results in a slightly better RMSE for forecasting 253-day CDR, but a slightly worse one for forecasting 21-day CDR.
+
+## Results
+
+```{r validate_model,include=TRUE,echo=TRUE,eval=TRUE}
+
+#Validate model
+#sweep out averages and stratify by z-score
+train_loess <- train %>%
+  ungroup() %>%
+  mutate(`7-day moving average` = round(z_score_7),
+         `20-day moving average` = round(z_score_20),
+         `50-day moving average` = round(z_score_50),
+         `100-day moving average` = round(z_score_100),
+         `200-day moving average` = round(z_score_200),
+         `500-day moving average` = round(z_score_500)) 
+train_loess$swept_21 <- train_loess$cdr_21 - ((train_loess$adjusted/(train_loess$adjusted/(1+train_loess$lifetime_return_to_date)))^(1/(train_loess$trading_days_to_date + lambda)) - 1) - train_loess$avg_sp500_cdr_to_date
+train_loess$swept_253 <- train_loess$cdr_253 - ((train_loess$adjusted/(train_loess$adjusted/(1+train_loess$lifetime_return_to_date)))^(1/(train_loess$trading_days_to_date + lambda)) - 1) - train_loess$avg_sp500_cdr_to_date
+train_loess <- train_loess %>% select(`7-day moving average`,`20-day moving average`,`50-day moving average`,
+                                      `100-day moving average`,`200-day moving average`,`500-day moving average`,swept_21)
+train_loess <- gather(train_loess,moving_average,z_score,1:6) 
+train_loess <- train_loess %>% mutate(moving_average = factor(moving_average,levels=c("7-day moving average",
+                                                                                      "20-day moving average",
+                                                                                      "50-day moving average",
+                                                                                      "100-day moving average",
+                                                                                      "200-day moving average",
+                                                                                      "500-day moving average"))) %>%
+  group_by(moving_average,z_score) %>%
+  summarize(n = n(),
+            mean_return = mean(swept_21),
+            se_return = sd(swept_21)/sqrt(n))
+
+#Fit a loess model
+loess_model <- loess(mean_return ~ z_score,data=train_loess,span = .3)
+
+#Predict returns for validation data set using loess model
+test_loess <- validation %>% ungroup()
+test_loess$swept_21 <- test_loess$cdr_21 - ((test_loess$adjusted/(test_loess$adjusted/(1+test_loess$lifetime_return_to_date)))^(1/(test_loess$trading_days_to_date + lambda)) - 1) - test_loess$avg_sp500_cdr_to_date
+test_loess$swept_253 <- test_loess$cdr_253 - ((test_loess$adjusted/(test_loess$adjusted/(1+test_loess$lifetime_return_to_date)))^(1/(test_loess$trading_days_to_date + lambda)) - 1) - test_loess$avg_sp500_cdr_to_date
+test_loess <- test_loess %>%
+  mutate(average_z_score = (z_score_7+z_score_20+z_score_50+z_score_100+z_score_200+z_score_500)/6)
+test_loess <- test_loess %>% select(swept_21,z_score = average_z_score)
+test_loess <- test_loess %>% drop_na()
+test_loess$forecast <- predict(loess_model,test_loess)
+model_rmses <- bind_rows(model_rmses,data.frame(model = "Final model validation",rmse_21_day = RMSE(test_loess$swept_21,test_loess$forecast),rmse_253_day=NA))
+
+
+#Repeat the above analysis for 253-day return
+#sweep out averages and stratify by z-score
+train_loess <- train %>%
+  ungroup() %>%
+  mutate(`7-day moving average` = round(z_score_7),
+         `20-day moving average` = round(z_score_20),
+         `50-day moving average` = round(z_score_50),
+         `100-day moving average` = round(z_score_100),
+         `200-day moving average` = round(z_score_200),
+         `500-day moving average` = round(z_score_500)) 
+train_loess$swept_21 <- train_loess$cdr_21 - ((train_loess$adjusted/(train_loess$adjusted/(1+train_loess$lifetime_return_to_date)))^(1/(train_loess$trading_days_to_date + lambda)) - 1) - train_loess$avg_sp500_cdr_to_date
+train_loess$swept_253 <- train_loess$cdr_253 - ((train_loess$adjusted/(train_loess$adjusted/(1+train_loess$lifetime_return_to_date)))^(1/(train_loess$trading_days_to_date + lambda)) - 1) - train_loess$avg_sp500_cdr_to_date
+train_loess <- train_loess %>% select(`7-day moving average`,`20-day moving average`,`50-day moving average`,
+                                      `100-day moving average`,`200-day moving average`,`500-day moving average`,swept_253) %>%
+  filter(!is.na(swept_253))
+train_loess <- gather(train_loess,moving_average,z_score,1:6) 
+train_loess <- train_loess %>% mutate(moving_average = factor(moving_average,levels=c("7-day moving average",
+                                                                                      "20-day moving average",
+                                                                                      "50-day moving average",
+                                                                                      "100-day moving average",
+                                                                                      "200-day moving average",
+                                                                                      "500-day moving average"))) %>%
+  group_by(moving_average,z_score) %>%
+  summarize(n = n(),
+            mean_return = mean(swept_253),
+            se_return = sd(swept_253)/sqrt(n))
+
+#Fit a loess model
+loess_model <- loess(mean_return ~ z_score,data=train_loess,span = .3)
+
+#Predict returns for validation data set using loess model
+test_loess <- validation %>% ungroup()
+test_loess$swept_21 <- test_loess$cdr_21 - ((test_loess$adjusted/(test_loess$adjusted/(1+test_loess$lifetime_return_to_date)))^(1/(test_loess$trading_days_to_date + lambda)) - 1) - test_loess$avg_sp500_cdr_to_date
+test_loess$swept_253 <- test_loess$cdr_253 - ((test_loess$adjusted/(test_loess$adjusted/(1+test_loess$lifetime_return_to_date)))^(1/(test_loess$trading_days_to_date + lambda)) - 1) - test_loess$avg_sp500_cdr_to_date
+test_loess <- test_loess %>%
+  mutate(average_z_score = (z_score_7+z_score_20+z_score_50+z_score_100+z_score_200+z_score_500)/6)
+test_loess <- test_loess %>% select(swept_253,z_score = average_z_score)
+test_loess <- test_loess %>% drop_na()
+test_loess$forecast <- predict(loess_model,test_loess)
+model_rmses$rmse_253_day[nrow(model_rmses)] <- RMSE(test_loess$swept_253,test_loess$forecast) 
+model_rmses %>% 
+  knitr::kable(caption="Model RMSEs")
+
+```
+
+Using my final model to forecast compound daily return for the validation data set produces a fairly bad RMSE for 21-day return, which points to the challenge of predicting stock prices over a short time frame. The result for 253-day return is somewhat better, although not greatly better than what we would expect from simply using the index average.
+
+## Conclusion
+
+This study result points to the inherent difficulty of forecasting out-of-sample stock price returns using in-sample data. Although we found some fairly compelling patterns, we were not able to produce accurate forecasts of future stock prices from those patterns. Any "edge" we obtained was small, at best.
