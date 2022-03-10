@@ -1,5 +1,3 @@
-#DELETE BEFORE SUBMITTING
-setwd("C:/Users/chris/OneDrive/Documents/R Studio/Education")
 
 
 
